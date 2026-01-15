@@ -15,3 +15,401 @@
         └── run_drc_checks.py
 ```
 
+julia
+using DeviceLayout
+using GDSII
+using StaticArrays
+
+# تعريف الطبقات من PDK
+const WAVEGUIDE_LAYER = LayerSpec(1, 0)   # طبقة Si3N4
+const NONLINEAR_LAYER = LayerSpec(2, 0)   # طبقة AlGaAs
+const HEATER_LAYER = LayerSpec(10, 0)     # طبقة TiN
+
+# ========== 1. تعريف دليل موجي أساسي ==========
+function create_straight_waveguide(start::Point, stop::Point, width::Float64=0.5)
+    """إنشاء دليل موجي مستقيم"""
+    # التحويل من micron إلى nanometer (وحدات GDSII)
+    start_nm = start * 1000
+    stop_nm = stop * 1000
+    width_nm = width * 1000
+    
+    # إنشاء مستطيل يمثل الدليل الموجي
+    waveguide = Rectangle(
+        start_nm,
+        stop_nm,
+        width_nm,
+        WAVEGUIDE_LAYER
+    )
+    
+    return waveguide
+end
+
+function create_bend_waveguide(center::Point, radius::Float64, 
+                               start_angle::Float64, end_angle::Float64,
+                               width::Float64=0.5)
+    """إنشاء دليل موجي منحني (منعطف)"""
+    # إنشاء قوس دائري
+    bend = CircularArc(
+        center * 1000,
+        radius * 1000,
+        start_angle,
+        end_angle,
+        width * 1000,
+        WAVEGUIDE_LAYER
+    )
+    
+    return bend
+end
+
+# ========== 2. تعريف مقسم شعاع (Directional Coupler) ==========
+function create_directional_coupler(center::Point, length::Float64=20.0, 
+                                    gap::Float64=0.15, coupling::Float64=0.5)
+    """إنشاء مقسم شعاع اتجاهي"""
+    # عرض الدليل الموجي
+    wg_width = 0.5  # μm
+    
+    # المواضيع النسبية للأدلة الأربعة
+    positions = [
+        Point(center.x - gap/2, center.y - length/2),
+        Point(center.x + gap/2, center.y - length/2),
+        Point(center.x - gap/2, center.y + length/2),
+        Point(center.x + gap/2, center.y + length/2)
+    ]
+    
+    components = []
+    
+    # الأدلة المستقيمة الرأسية
+    for pos in positions
+        wg = create_straight_waveguide(
+            Point(pos.x, pos.y - length/2),
+            Point(pos.x, pos.y + length/2),
+            wg_width
+        )
+        push!(components, wg)
+    end
+    
+    # منطقة الاقتران (المنطقة المركزية)
+    coupling_region = Rectangle(
+        Point(center.x - gap/2 - wg_width/2, center.y - 2.0) * 1000,
+        Point(center.x + gap/2 + wg_width/2, center.y + 2.0) * 1000,
+        4.0 * 1000,  # طول منطقة الاقتران
+        WAVEGUIDE_LAYER
+    )
+    
+    push!(components, coupling_region)
+    
+    return CompositeComponent("DirectionalCoupler_$(coupling)", components)
+end
+
+# ========== 3. تعريف حلقة رنانة غير خطية ==========
+function create_kerr_ring_resonator(center::Point, radius::Float64=5.0,
+                                    bus_waveguide_offset::Float64=0.2,
+                                    material::String="AlGaAs")
+    """إنشاء حلقة رنانة غير خطية مع دليل حافلة"""
+    
+    # تحديد الطبقة بناءً على المادة
+    layer = material == "AlGaAs" ? NONLINEAR_LAYER : WAVEGUIDE_LAYER
+    
+    components = []
+    
+    # 1. الحلقة الرنانة الدائرية
+    ring = Circle(
+        center * 1000,
+        radius * 1000,
+        0.5 * 1000,  # عرض الدليل
+        layer
+    )
+    
+    # 2. دليل الحافلة (Bus Waveguide)
+    bus_y = center.y + radius + bus_waveguide_offset
+    bus_start = Point(center.x - radius - 5.0, bus_y)
+    bus_end = Point(center.x + radius + 5.0, bus_y)
+    
+    bus_wg = create_straight_waveguide(bus_start, bus_end, 0.5)
+    
+    # 3. منطقة الاقتران بين الحلقة والدليل
+    coupling_length = 2.0  # μm
+    coupling_gap = 0.15    # μm
+    
+    coupling_center = Point(center.x, bus_y - bus_waveguide_offset/2)
+    coupling_region = Rectangle(
+        Point(coupling_center.x - 1.0, coupling_center.y - 0.1) * 1000,
+        Point(coupling_center.x + 1.0, coupling_center.y + 0.1) * 1000,
+        coupling_length * 1000,
+        layer
+    )
+    
+    push!(components, ring, bus_wg, coupling_region)
+    
+    return CompositeComponent("KerrRing_R$(radius)um", components)
+end
+
+# ========== 4. تعريف مسخن حراري (Phase Shifter) ==========
+function create_thermal_phase_shifter(start::Point, length::Float64=100.0,
+                                      width::Float64=0.5)
+    """إنشاء مسخن حراري للتحكم بالطور"""
+    components = []
+    
+    # 1. الدليل الموجي الأساسي
+    waveguide = create_straight_waveguide(start, Point(start.x + length, start.y), width)
+    
+    # 2. المسخن المعدني فوق الدليل (مع عزلة)
+    heater_y_offset = 1.0  # μm فوق الدليل
+    heater_start = Point(start.x, start.y + heater_y_offset)
+    heater_end = Point(start.x + length, start.y + heater_y_offset)
+    heater_width = 0.3  # عرض أضيق للمسخن
+    
+    # إنشاء المسخن كمستطيل
+    heater = Rectangle(
+        heater_start * 1000,
+        heater_end * 1000,
+        heater_width * 1000,
+        HEATER_LAYER
+    )
+    
+    # 3. نقاط التوصيل الكهربائي
+    contact_size = 2.0  # μm
+    left_contact = Rectangle(
+        Point(start.x - contact_size/2, start.y + heater_y_offset - 0.5) * 1000,
+        Point(start.x + contact_size/2, start.y + heater_y_offset + 0.5) * 1000,
+        contact_size * 1000,
+        HEATER_LAYER
+    )
+    
+    right_contact = Rectangle(
+        Point(start.x + length - contact_size/2, start.y + heater_y_offset - 0.5) * 1000,
+        Point(start.x + length + contact_size/2, start.y + heater_y_offset + 0.5) * 1000,
+        contact_size * 1000,
+        HEATER_LAYER
+    )
+    
+    push!(components, waveguide, heater, left_contact, right_contact)
+    
+    return CompositeComponent("PhaseShifter_$(length)um", components)
+end
+
+# ========== 5. بناء دارة كاملة (مثال: دارة Bell State) ==========
+function create_bell_state_circuit()
+    """بناء دارة توليد حالة Bell متشابكة"""
+    
+    circuit_components = []
+    current_position = Point(0, 0)
+    
+    # 1. مصدر فوتونين (منطقة توليد SPDC)
+    spdc_source = Rectangle(
+        Point(-10, -5) * 1000,
+        Point(-5, 5) * 1000,
+        10.0 * 1000,
+        NONLINEAR_LAYER
+    )
+    push!(circuit_components, spdc_source)
+    
+    # 2. مقسم شعاع 50:50
+    bs_position = Point(0, 0)
+    bs = create_directional_coupler(bs_position, 20.0, 0.15, 0.5)
+    push!(circuit_components, bs)
+    
+    # 3. مسخنين طور (لضبط التداخل)
+    ps1 = create_thermal_phase_shifter(Point(10, 2), 50.0, 0.5)
+    ps2 = create_thermal_phase_shifter(Point(10, -2), 50.0, 0.5)
+    push!(circuit_components, ps1, ps2)
+    
+    # 4. حلقة رنانة لبوابة CNOT غير خطية
+    cnot_ring = create_kerr_ring_resonator(Point(30, 0), 5.0, 0.2, "AlGaAs")
+    push!(circuit_components, cnot_ring)
+    
+    # 5. وصلات الأدلة الموجية بين المكونات
+    connections = [
+        # من المصدر إلى مقسم الشعاع
+        create_straight_waveguide(Point(-5, 1), Point(-10, 1), 0.5),
+        create_straight_waveguide(Point(-5, -1), Point(-10, -1), 0.5),
+        
+        # من مقسم الشعاع إلى مسخني الطور
+        create_straight_waveguide(Point(10, 3), Point(20, 3), 0.5),
+        create_straight_waveguide(Point(10, -3), Point(20, -3), 0.5),
+        
+        # من مسخني الطور إلى الحلقة الرنانة
+        create_straight_waveguide(Point(40, 2), Point(50, 2), 0.5),
+        create_straight_waveguide(Point(40, -2), Point(50, -2), 0.5)
+    ]
+    
+    push!(circuit_components, connections...)
+    
+    # 6. مناطق الكواشف (نهاية الدارة)
+    detectors = []
+    for (i, y) in enumerate([3, -3])
+        detector = Rectangle(
+            Point(60, y - 1) * 1000,
+            Point(65, y + 1) * 1000,
+            2.0 * 1000,
+            WAVEGUIDE_LAYER
+        )
+        push!(detectors, detector)
+    end
+    
+    push!(circuit_components, detectors...)
+    
+    return CompositeComponent("BellStateCircuit_v1", circuit_components)
+end
+
+# ========== 6. الدالة الرئيسية: توليد وتصدير التخطيط ==========
+function main()
+    println("بدء توليد تخطيط الرقاقة الكمومية الضوئية...")
+    
+    # 1. إنشاء الدارة الرئيسية
+    main_circuit = create_bell_state_circuit()
+    
+    # 2. إضافة خلية اختبار للمكونات الفردية
+    test_structures = []
+    
+    # مصفوفة اختبار للمكونات الأساسية
+    test_pos = Point(0, -50)  # أسفل الدارة الرئيسية
+    
+    # مقسمات أشعة بمعاملات اقتران مختلفة
+    for (i, coupling) in enumerate([0.1, 0.3, 0.5, 0.7, 0.9])
+        bs = create_directional_coupler(
+            Point(test_pos.x + i * 25, test_pos.y),
+            15.0, 0.15, coupling
+        )
+        push!(test_structures, bs)
+    end
+    
+    # حلقات رنانة بأحجام مختلفة
+    for (i, radius) in enumerate([3.0, 4.0, 5.0, 6.0, 7.0])
+        ring = create_kerr_ring_resonator(
+            Point(test_pos.x + i * 25, test_pos.y - 20),
+            radius, 0.2, "AlGaAs"
+        )
+        push!(test_structures, ring)
+    end
+    
+    test_cell = CompositeComponent("TestStructures", test_structures)
+    
+    # 3. تجميع الخلايا النهائية
+    library = ComponentLibrary()
+    add_component!(library, main_circuit)
+    add_component!(library, test_cell)
+    
+    # 4. تصدير إلى ملف GDSII
+    output_file = "../layouts/main_chip.gds"
+    save_gds(library, output_file, "QUANTUM_SOVEREIGN_CHIP", "1.0")
+    
+    println("تم إنشاء التخطيط بنجاح!")
+    println("الملف الناتج: ", output_file)
+    println("الأبعاد التقريبية: 70μm × 60μm (بدون هياكل الاختبار)")
+    
+    # 5. إنشاء تقرير بسيط
+    report = """
+    تقرير توليد التخطيط - الرقاقة الكمومية السيادية
+    ================================================
+    التاريخ: $(now())
+    الملف الناتج: $(output_file)
+    
+    المكونات المتضمنة:
+    - 1 دارة توليد حالة Bell كاملة
+    - 5 مقسمات أشعة بمعاملات اقتران مختلفة
+    - 5 حلقات رنانة غير خطية بأحجام مختلفة
+    - مسخنين طور حراريين
+    
+    الطبقات المستخدمة:
+    - الطبقة 1: Si₃N₄ waveguides
+    - الطبقة 2: AlGaAs nonlinear elements
+    - الطبقة 10: TiN thermal heaters
+    
+    الخطوات التالية:
+    1. فتح ملف GDSII في KLayout للتحقق البصري
+    2. تشغيل فحص قواعد التصميم (DRC)
+    3. إرسال الملف لمنشأة التصنيع للمراجعة
+    """
+    
+    # حفظ التقرير
+    open("../layouts/generation_report.txt", "w") do f
+        write(f, report)
+    end
+    
+    println("\nتم إنشاء تقرير في: ../layouts/generation_report.txt")
+    
+    return library
+end
+
+# تشغيل الدالة الرئيسية
+if abspath(PROGRAM_FILE) == @__FILE__
+    main()
+end
+```
+
+📋 الخطوة 4: التحقق والتصدير
+
+4.1 سكريبت التحقق من قواعد التصميم (DRC)
+
+أنشئ ملف /03_FABRICATION/scripts/run_drc_checks.py:
+
+```python
+"""
+سكريبت للتحقق من قواعد تصميم الرقاقة (DRC)
+"""
+import gdspy
+import yaml
+import json
+
+def load_design_rules(pdk_path):
+    """تحميل قواعد التصميم من ملف PDK"""
+    with open(pdk_path, 'r') as f:
+        return yaml.safe_load(f)
+
+def run_drc_checks(gds_file, pdk_path):
+    """تشغيل فحوصات DRC الأساسية"""
+    
+    # تحميل ملف GDS
+    lib = gdspy.GdsLibrary(infile=gds_file)
+    
+    # تحميل قواعد التصميم
+    with open(pdk_path, 'r') as f:
+        pdk = json.load(f)
+    rules = pdk['design_rules']
+    
+    errors = []
+    warnings = []
+    
+    # فحص كل خلية في المكتبة
+    for cell_name, cell in lib.cells.items():
+        # 1. فحص المسافات الدنيا بين الأدلة الموجية
+        for layer in [1, 2]:  # طبقات الأدلة الموجية
+            polygons = cell.get_polygons(by_spec=True).get((layer, 0), [])
+            
+            # فحص المسافات بين المضلعات
+            for i, poly1 in enumerate(polygons):
+                for j, poly2 in enumerate(polygons[i+1:], i+1):
+                    # حساب المسافة بين المضلعات
+                    # (هذا مثال مبسط - في الواقع تحتاج لخوارزمية أكثر تعقيدًا)
+                    pass
+    
+    return errors, warnings
+
+def generate_drc_report(errors, warnings, output_file):
+    """توليد تقرير DRC"""
+    report = f"""
+    تقرير فحص قواعد التصميم (DRC)
+    =============================
+    التاريخ: {datetime.now().isoformat()}
+    
+    الملخص:
+    - عدد الأخطاء: {len(errors)}
+    - عدد التحذيرات: {len(warnings)}
+    
+    الأخطاء:
+    {chr(10).join(f'  • {e}' for e in errors)}
+    
+    التحذيرات:
+    {chr(10).join(f'  • {w}' for w in warnings)}
+    
+    التوصيات:
+    1. {'جميع الفحوصات سليمة' if not errors else 'يجب إصلاح الأخطاء قبل الإرسال للتصنيع'}
+    2. {'لا توجد تحذيرات' if not warnings else 'مراجعة التحذيرات'}
+    """
+    
+    with open(output_file, 'w', encoding='utf-8') as f:
+        f.write(report)
+    
+    return report
+```
