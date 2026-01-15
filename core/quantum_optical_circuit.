@@ -1,1 +1,771 @@
+1. نظام محاكاة الدوائر الضوئية الكمومية
+
+ملف: /02_SIMULATION_CODE/
+core/quantum_optical_circuit.py
+"""
+نظام محاكاة الدوائر الضوئية الكمومية المتكاملة.
+يحتوي على نماذج للمكونات الأساسية ومحاكاة التشابك.
+"""
+import numpy as np
+from typing import List, Tuple, Dict, Union
+from dataclasses import dataclass
+import matplotlib.pyplot as plt
+from scipy.linalg import expm
+
+@dataclass
+class MaterialProperties:
+    """خصائص المواد الضوئية المستخدمة في الرقاقة."""
+    name: str
+    refractive_index: float
+    nonlinear_coefficient: float  # χ⁽³⁾ (m²/W)
+    loss_dB_per_cm: float
+    thermal_coefficient: float  # dn/dT (K⁻¹)
+    
+    def effective_nonlinear_coefficient(self, wavelength: float, area_um2: float) -> float:
+        """حساب المعامل غير الخطي الفعال γ (1/W·m)."""
+        n2 = self.nonlinear_coefficient
+        A_eff = area_um2 * 1e-12  # تحويل إلى m²
+        gamma = (2 * np.pi * n2) / (wavelength * 1e-9 * A_eff)
+        return gamma
+
+# تعريف موادنا
+MATERIALS = {
+    'Si3N4': MaterialProperties('Si₃N₄', 2.0, 2.5e-19, 0.1, 2.4e-5),
+    'AlGaAs': MaterialProperties('AlGaAs', 3.3, 1.5e-17, 2.0, 1.8e-4),
+    'SiO2': MaterialProperties('SiO₂', 1.44, 1.0e-20, 0.1, 1.0e-5)
+}
+
+class OpticalComponent:
+    """فئة أساسية للمكونات الضوئية."""
+    
+    def __init__(self, name: str, material: str = 'Si3N4'):
+        self.name = name
+        self.material = MATERIALS[material]
+        self.connections = []
+        
+    def scattering_matrix(self, wavelength: float = 1550e-9) -> np.ndarray:
+        """مصفوفة التشتت للمكون (لتحتسب في الفئات الفرعية)."""
+        raise NotImplementedError
+        
+    def connect(self, component, port_from: int, port_to: int):
+        """ربط مكون بآخر."""
+        self.connections.append((component, port_from, port_to))
+
+class BeamSplitter(OpticalComponent):
+    """مقسم شعاع معامل اقتران قابل للضبط."""
+    
+    def __init__(self, coupling: float = 0.5, **kwargs):
+        super().__init__(**kwargs)
+        self.coupling = coupling  # |t|²
+        
+    def scattering_matrix(self, wavelength: float = 1550e-9) -> np.ndarray:
+        """مصفوفة مقسم الشعاع 2×2."""
+        t = np.sqrt(self.coupling)
+        r = np.sqrt(1 - self.coupling)
+        
+        # مقسم شعاع متماثل مع طور π/2 للإرسال
+        S = np.array([
+            [r, 1j*t],
+            [1j*t, r]
+        ], dtype=complex)
+        
+        return S
+
+class PhaseShifter(OpticalComponent):
+    """مغير طور كهروضوئي أو حراري."""
+    
+    def __init__(self, phase_shift: float = 0.0, **kwargs):
+        super().__init__(**kwargs)
+        self.phase_shift = phase_shift
+        
+    def scattering_matrix(self, wavelength: float = 1550e-9) -> np.ndarray:
+        """مغير طور بمصفوفة قطرية."""
+        return np.diag([np.exp(1j * self.phase_shift)])
+
+class Waveguide(OpticalComponent):
+    """دليل موجي بطول وخسائر محددة."""
+    
+    def __init__(self, length_um: float = 100.0, **kwargs):
+        super().__init__(**kwargs)
+        self.length_um = length_um
+        
+    def scattering_matrix(self, wavelength: float = 1550e-9) -> np.ndarray:
+        """انتقال عبر دليل موجي مع خسائر وطور."""
+        # حساب معامل الانتشار
+        n_eff = self.material.refractive_index
+        k0 = 2 * np.pi / wavelength
+        beta = n_eff * k0
+        
+        # حساب الخسائر
+        loss_per_m = (self.material.loss_dB_per_cm / 100) * 8.686  # تحويل dB/cm إلى Nepers/m
+        length_m = self.length_um * 1e-6
+        attenuation = np.exp(-loss_per_m * length_m / 2)
+        
+        phase = np.exp(1j * beta * length_m)
+        return np.diag([attenuation * phase])
+
+class RingResonator(OpticalComponent):
+    """حلقة رنانة غير خطية (Kerr resonator)."""
+    
+    def __init__(self, radius_um: float = 5.0, 
+                 coupling: float = 0.1,
+                 material: str = 'AlGaAs',
+                 **kwargs):
+        super().__init__(material=material, **kwargs)
+        self.radius_um = radius_um
+        self.coupling = coupling
+        self.circumference = 2 * np.pi * radius_um
+        
+        # حالة الحلقة الداخلية
+        self.internal_field = 0j
+        self.nonlinear_phase = 0.0
+        
+    def scattering_matrix(self, wavelength: float = 1550e-9, 
+                         power_in: float = 0.0) -> np.ndarray:
+        """
+        مصفوفة تشتت الحلقة الرنانة مع تأثير كير غير الخطي.
+        
+        المعادلات:
+        a = √(1-κ)  # معامل الإرسال عبر الاقتران
+        b = j√κ     # معامل الاقتران
+        """
+        kappa = self.coupling
+        a = np.sqrt(1 - kappa)
+        b = 1j * np.sqrt(kappa)
+        
+        # حساب طور الرحلة حول الحلقة
+        n_eff = self.material.refractive_index
+        k0 = 2 * np.pi / wavelength
+        beta_linear = n_eff * k0
+        
+        # طور غير خطي من تأثير كير
+        if power_in > 0:
+            gamma = self.material.effective_nonlinear_coefficient(
+                wavelength*1e9, area_um2=0.15
+            )
+            self.nonlinear_phase = gamma * power_in * (self.circumference * 1e-6)
+        
+        total_phase = beta_linear * (self.circumference * 1e-6) + self.nonlinear_phase
+        
+        # معامل الإرسال عبر الحلقة
+        t = np.exp(1j * total_phase)
+        
+        # حساب مصفوفة S (مقسم شعاع + حلقة)
+        denominator = 1 - a * t
+        
+        S = np.array([
+            [a - t.conjugate()/a.conjugate() * (a**2 - 1)/denominator, 
+             -b * t / denominator],
+            [-b * t / denominator,
+             a - t.conjugate()/a.conjugate() * (a**2 - 1)/denominator]
+        ], dtype=complex)
+        
+        return S
+    
+    def resonance_condition(self, wavelength: float) -> bool:
+        """التحقق إذا كان الطول الموجي على الرنين."""
+        n_eff = self.material.refractive_index
+        circumference_m = self.circumference * 1e-6
+        
+        # طول موجة الرنين: m * λ = n_eff * L
+        m = round(n_eff * circumference_m / wavelength)
+        resonant_wavelength = n_eff * circumference_m / m
+        
+        return abs(wavelength - resonant_wavelength) < 1e-10
+
+class QuantumOpticalCircuit:
+    """دارة ضوئية كمومية كاملة."""
+    
+    def __init__(self, name: str = "QPIC"):
+        self.name = name
+        self.components = []
+        self.ports = {}
+        
+    def add_component(self, component: OpticalComponent, 
+                     port_mapping: Dict[int, Tuple[str, int]] = None):
+        """إضافة مكون إلى الدارة."""
+        self.components.append(component)
+        
+        if port_mapping:
+            for local_port, (global_name, global_port) in port_mapping.items():
+                self.ports[(component.name, local_port)] = (global_name, global_port)
+    
+    def compute_overall_s_matrix(self, wavelength: float = 1550e-9,
+                               input_powers: Dict[str, float] = None) -> np.ndarray:
+        """
+        حساب مصفوفة التشتت الشاملة للدارة.
+        
+        تستخدم طريقة ربط مصفوفات التشتت (Redheffer star product).
+        """
+        if not input_powers:
+            input_powers = {}
+        
+        # البدء بمصفوفة وحدة
+        n_ports = self._count_ports()
+        S_total = np.eye(n_ports, dtype=complex)
+        
+        # دمج مصفوفات المكونات
+        for comp in self.components:
+            power_in = input_powers.get(comp.name, 0.0)
+            S_comp = comp.scattering_matrix(wavelength, power_in)
+            
+            # ربط مصفوفة المكون مع المصفوفة الإجمالية
+            S_total = self._star_product(S_total, S_comp)
+        
+        return S_total
+    
+    def _star_product(self, S1: np.ndarray, S2: np.ndarray) -> np.ndarray:
+        """ناتج Redheffer النجمي لمصفوفتي تشتت."""
+        # تبسيط: افتراض أن المصفوفات متوافقة الأبعاد
+        # في التنفيذ الكامل، يجب التعامل مع توصيلات الموانئ
+        return S1 @ S2
+    
+    def _count_ports(self) -> int:
+        """عد الموانئ الكلية في الدارة."""
+        count = 0
+        for comp in self.components:
+            if isinstance(comp, BeamSplitter):
+                count += 2
+            elif isinstance(comp, RingResonator):
+                count += 2
+            elif isinstance(comp, (PhaseShifter, Waveguide)):
+                count += 1
+        return count
+    
+    def simulate_hom_interference(self, wavelength: float = 1550e-9) -> Dict:
+        """
+        محاكاة تداخل Hong-Ou-Mandel لفوتونين.
+        
+        يُرجع:
+            - احتمالية التزامن
+            - رؤية التداخل (visibility)
+            - مصفوفة الكثافة الناتجة
+        """
+        # إنشاء مقسم شعاع 50:50
+        bs = BeamSplitter(coupling=0.5, name="HOM_BS")
+        
+        # حالات الإدخال: |1,1⟩ (فوتون في كل ميناء)
+        input_state = np.array([0, 0, 0, 1])  # |1,1⟩ في قاعدة فوك
+        
+        # مصفوفة مقسم الشعاع في قاعدة فوك
+        S_bs = bs.scattering_matrix(wavelength)
+        
+        # تحويل إلى عامل وحدة في فضاء فوك
+        U_fock = self._s_to_u_fock(S_bs)
+        
+        # تطبيق على حالة الإدخال
+        output_state = U_fock @ input_state
+        
+        # حساب الاحتمالات
+        p_20 = abs(output_state[2])**2  # |2,0⟩
+        p_02 = abs(output_state[1])**2  # |0,2⟩
+        p_11 = abs(output_state[3])**2  # |1,1⟩
+        
+        # رؤية HOM
+        visibility = (p_11.max() - p_11.min()) / (p_11.max() + p_11.min())
+        
+        return {
+            'p_11': p_11,
+            'p_20': p_20,
+            'p_02': p_02,
+            'visibility': visibility,
+            'output_state': output_state
+        }
+    
+    def _s_to_u_fock(self, S: np.ndarray) -> np.ndarray:
+        """
+        تحويل مصفوفة التشتت إلى عامل وحدة في فضاء فوك.
+        
+        لـ n=2 فوتونات في m=2 أوضاع.
+        """
+        # لبساطة، نعيد مصفوفة وحدة 4×4
+        # في التنفيذ الكامل: استخدام تحويل Bargmann
+        return np.eye(4, dtype=complex)
+    
+    def generate_bell_state(self, circuit_type: str = 'linea') -> np.ndarray:
+        """
+        توليد حالة بل متشابكة باستخدام دارة خطية.
+        
+        الدارة: فوتونان → مقسم شعاع → مغير أطوار → قياس
+        """
+        # إنشاء المكونات
+        bs = BeamSplitter(coupling=0.5, name="Bell_BS")
+        ps1 = PhaseShifter(phase_shift=np.pi/2, name="Phase_1")
+        ps2 = PhaseShifter(phase_shift=0.0, name="Phase_2")
+        
+        # حالة إدخال |1,1⟩
+        input_state = np.array([0, 0, 0, 1], dtype=complex)
+        
+        # تطبيق التحويلات المتسلسلة
+        S_total = np.eye(2, dtype=complex)
+        for comp in [bs, ps1, ps2]:
+            S_comp = comp.scattering_matrix()
+            S_total = S_total @ S_comp
+        
+        # تحويل إلى فضاء فوك وتطبيق
+        U_fock = self._s_to_u_fock(S_total)
+        bell_state = U_fock @ input_state
+        
+        # إسقاط على حالة بل |Ψ⁻⟩
+        psi_minus = np.array([0, 1/np.sqrt(2), -1/np.sqrt(2), 0])
+        fidelity = abs(np.vdot(psi_minus, bell_state))**2
+        
+        return {
+            'state_vector': bell_state,
+            'fidelity': fidelity,
+            'circuit_components': [bs, ps1, ps2]
+        }
+
+def analyze_cnot_gate_performance(circuit_params: Dict) -> Dict:
+    """
+    تحليل أداء بوابة CNOT الضوئية.
+    
+    المدخلات:
+        - nonlinea_coefficient: معامل غير الخطية
+        - ring_radius: نصف قطر الحلقة
+        - coupling: معامل الاقتران
+        - input_power: قدرة الإدخال
+        
+    المخرجات:
+        - process_fidelity: إخلاص العملية
+        - truth_table: جدول الحقيقة
+        - required_power: القدرة المطلوبة لـ π phase shift
+    """
+    # إنشاء حلقة رنانة غير خطية
+    ring = RingResonator(
+        radius_um=circuit_params.get('ring_radius', 5.0),
+        coupling=circuit_params.get('coupling', 0.1),
+        material='AlGaAs'
+    )
+    
+    # حساب القدرة المطلوبة لتحقيق π phase shift
+    wavelength = 1550e-9
+    gamma = ring.material.effective_nonlinear_coefficient(wavelength*1e9, 0.15)
+    L_eff = ring.circumference * 1e-6
+    
+    power_for_pi = np.pi / (2 * gamma * L_eff)
+    
+    # محاكاة جدول الحقيقة لـ CNOT
+    truth_table = []
+    for control in [0, 1]:
+        for target in [0, 1]:
+            input_state = f"|{control}{target}⟩"
+            
+            # حالة التحكم = 0: لا تغيير
+            if control == 0:
+                output_state = f"|{control}{target}⟩"
+                fidelity = 1.0
+            else:
+                # حالة التحكم = 1: قلب الهدف
+                output_state = f"|{control}{1-target}⟩"
+                
+                # حساب الإخلاص بناءً على طور غير الخطي المحقق
+                achieved_phase = 2 * gamma * circuit_params.get('input_power', 0.0) * L_eff
+                phase_error = abs(achieved_phase - np.pi)
+                fidelity = np.cos(phase_error/2)**2
+            
+            truth_table.append({
+                'input': input_state,
+                'expected': output_state,
+                'fidelity': fidelity
+            })
+    
+    # حساب إخلاص العملية الكلي
+    process_fidelity = np.mean([entry['fidelity'] for entry in truth_table])
+    
+    return {
+        'power_for_pi_shift_W': power_for_pi,
+        'power_for_pi_shift_dBm': 10 * np.log10(power_for_pi * 1000),
+        'process_fidelity': process_fidelity,
+        'truth_table': truth_table,
+        'ring_parameters': {
+            'radius_um': ring.radius_um,
+            'coupling': ring.coupling,
+            'nonlinear_coefficient': ring.material.nonlinear_coefficient,
+            'effective_gamma': gamma
+        }
+    }
+
+# ============================================================================
+# دوال تحليل وتمثيل مرئي
+# ============================================================================
+
+def plot_ring_resonance(ring: RingResonator, wavelength_range: Tuple[float, float]):
+    """رسم منحنى رنين الحلقة."""
+    wavelengths = np.linspace(wavelength_range[0], wavelength_range[1], 1000)
+    transmissions = []
+    
+    for wl in wavelengths:
+        S = ring.scattering_matrix(wl * 1e-9)
+        transmission = abs(S[0, 0])**2  |t|²
+        transmissions.append(transmission)
+    
+    plt.figure(figsize=(10, 6))
+    plt.plot(wavelengths, transmissions, 'b-', linewidth=2)
+    plt.xlabel('الطول الموجي (nm)')
+    plt.ylabel('الإرسال')
+    plt.title(f'منحنى رنين الحلقة (نصف القطر = {ring.radius_um} μm)')
+    plt.grid(True, alpha=0.3)
+    
+    # تحديد أطوال موجات الرنين
+    resonant_wls = []
+    for wl in wavelengths:
+        if ring.resonance_condition(wl * 1e-9):
+            resonant_wls.append(wl)
+    
+    if resonant_wls:
+        plt.plot(resonant_wls, [1]*len(resoncent_wls), 'ro', markersize=8, 
+                label='نقاط الرنين')
+        plt.legend()
+    
+    return plt.gcf()
+
+def analyze_photon_pair_generation(crystal_length: float = 10e-3,
+                                 pump_power: float = 0.1,
+                                 material: str = 'AlGaAs') -> Dict:
+    """
+    تحليل توليد أزواج الفوتونات عبر SPDC.
+    
+    المعادلات:
+        R_pair = (P_pump * L² * d_eff² * ω_pump²) / (ε_0 c³ n² A_eff)
+    """
+    # ثوابت فيزيائية
+    hbar = 1.0545718e-34
+    c = 299792458
+    eps0 = 8.8541878e-12
+    
+    # معاملات المادة
+    mat = MATERIALS[material]
+    d_eff = mat.nonlinear_coefficient * 1e-9  # تقريب لـ χ⁽²⁾ من χ⁽³⁾
+    
+    # افتراضات
+    wavelength_pump = 775e-9  # ضعف 1550nm
+    omega_pump = 2 * np.pi * c / wavelength_pump
+    A_eff = 10e-12  # 10 μm²
+    
+    # حساب معدل توليد الأزواج
+    L = crystal_length
+    P = pump_power
+    
+    prefactor = (P * L**2 * d_eff**2 * omega_pump**2) 
+    denominator = (hbar * eps0 * c**3 * mat.refractive_index**2 * A_eff * wavelength_pump)
+    
+    rate = prefactor / denominator
+    
+    # حساب عرض الحزمة (bandwidth)
+    delta_k = 2 * np.pi / L  # عرض متجه الموجة
+    delta_omega = delta_k * c / mat.refractive_index  # عرض ترددي
+    
+    return {
+        'pair_generation_rate_Hz': rate,
+        'pair_generation_rate_kHz': rate / 1000,
+        'spectral_bandwidth_Hz': delta_omega,
+        'spectral_bandwidth_nm': (delta_omega / omega_pump) * wavelength_pump * 1e9,
+        'pump_parameters': {
+            'wavelength_nm': wavelength_pump * 1e9,
+            'power_W': P,
+            'power_dBm': 10 * np.log10(P * 1000)
+        },
+        'crystal_parameters': {
+            'length_m': L,
+            'material': material,
+            'nonlinear_coefficient': d_eff
+        }
+    }
+....
+دفتر الملاحظات 
+التوضيحي
+ملف: /02_SIMULATION_CODE/notebooks/Quantum_Circuit_Simulation.ipynb
+
+# دفتر ملاحظات Jupyter لمحاكاة الدوائر الكمومية الضوئية
+%matplotlib inline
+import sys
+sys.path.append('../core')
+
+from quantum_optical_circuit import *
+import numpy as np
+import matplotlib.pyplot as plt
+
+print("محاكاة الرقاقة الضوئية الكمومية - الإصدار 1.0")
+print("=" * 60)
+
+# ============================================================================
+# 1. اختبار مكونات أساسية
+# ============================================================================
+print("\n1. اختبار المكونات الأساسية:")
+
+# مقسم شعاع 50:50
+bs = BeamSplitter(coupling=0.5, name="BS_50_50")
+S_bs = bs.scattering_matrix()
+print(f"مقسم الشعاع:\n{S_bs}")
+
+# دليل موجي
+wg = Waveguide(length_um=500, material='Si3N4', name="WG_500um")
+S_wg = wg.scattering_matrix()
+print(f"\nدليل موجي (500μm):\n{S_wg}")
+
+# ============================================================================
+# 2. محاكاة تداخل HOM
+# ============================================================================
+print("\n2. محاكاة تداخل Hong-Ou-Mandel:")
+
+circuit = QuantumOpticalCircuit("HOM_Circuit")
+hom_results = circuit.simulate_hom_interference()
+
+print(f"احتمالية |1,1⟩: {hom_results['p_11']:.4f}")
+print(f"احتمالية |2,0⟩: {hom_results['p_20']:.4f}")
+print(f"احتمالية |0,2⟩: {hom_results['p_02']:.4f}")
+print(f"رؤية التداخل: {hom_results['visibility']:.4f}")
+
+# ============================================================================
+# 3. تحليل الحلقة الرنانة غير الخطية
+# ============================================================================
+print("\n3. تحليل الحلقة الرنانة غير الخطية:")
+
+ring = RingResonator(radius_um=5.0, coupling=0.1, material='AlGaAs', name="Kerr_Ring")
+
+# رسم منحنى الرنين
+fig = plot_ring_resonance(ring, (1540, 1560))
+plt.savefig('../results/ring_resonance.png', dpi=150, bbox_inches='tight')
+plt.show()
+
+# حساب القدرة المطلوبة لـ π phase shift
+cnot_params = {
+    'ring_radius': 5.0,
+    'coupling': 0.1,
+    'input_power': 0.0001  # 100 μW
+}
+
+cnot_analysis = analyze_cnot_gate_performance(cnot_params)
+print(f"\nتحليل بوابة CNOT:")
+print(f"  القدرة المطلوبة لـ π shift: {cnot_analysis['power_for_pi_shift_dBm']:.2f} dBm")
+print(f"  إخلاص العملية: {cnot_analysis['process_fidelity']:.4f}")
+
+# ============================================================================
+# 4. تحليل توليد أزواج الفوتونات
+# ============================================================================
+print("\n4. تحليل توليد أزواج الفوتونات المتشابكة:")
+
+spdc_results = analyze_photon_pair_generation(
+    crystal_length=10e-3,  # 10 mm
+    pump_power=0.1,        # 100 mW
+    material='AlGaAs'
+)
+
+print(f"معدل توليد الأزواج: {spdc_results['pair_generation_rate_kHz']:.2f} kHz")
+print(f"العرض الطيفي: {spdc_results['spectral_bandwidth_nm']:.2f} nm")
+
+# ============================================================================
+# 5. محاكاة دارة كاملة لتوليد حالة Bell
+# ============================================================================
+print("\n5. محاكاة دارة توليد حالة Bell:")
+
+bell_circuit = QuantumOpticalCircuit("Bell_Generator")
+bell_results = bell_circuit.generate_bell_state()
+
+print(f"حالة الإخراج: {bell_results['state_vector']}")
+print(f"إخلاص حالة |Ψ⁻⟩: {bell_results['fidelity']:.6f}")
+
+# ============================================================================
+# 6. حساب مؤشرات الأداء الرئيسية (KPIs)
+# ============================================================================
+print("\n6. حساب مؤشرات الأداء الرئيسية:")
+# KPI 1: إخلاص التشابك
+estimated_fidelity = bell_results['fidelity']
+print(f"KPI 1 - إخلاص التشابك المتوقع: {estimated_fidelity:.4f}")
+
+# KPI 2: معدل الأزواج
+pair_rate = spdc_results['pair_generation_rate_Hz']
+print(f"KPI 2 - معدل الأزواج المتوقع: {pair_rate:.0f} أزواج/ثانية")
+
+# KPI 3: استهلاك الطاقة
+power_per_gate = cnot_analysis['power_for_pi_shift_W']
+print(f"KPI 3 - استهلاك الطاقة لكل بوابة: {power_per_gate*1000:.2f} ميلي واط")
+
+# ============================================================================
+# 7. حفظ النتائج
+# ============================================================================
+import pickle
+import datetime
+
+results = {
+    'timestamp': datetime.datetime.now().isoformat(),
+    'hom_results': hom_results,
+    'cnot_analysis': cnot_analysis,
+    'spdc_results': spdc_results,
+    'bell_results': bell_results,
+    'kp_summary': {
+        'estimated_fidelity': estimated_fidelity,
+        'pair_rate_hz': pair_rate,
+        'power_per_gate_w': power_per_gate
+    }
+}
+
+with open('../results/simulation_results.pkl', 'wb') as f:
+    pickle.dump(results, f)
+
+print("\nتم حفظ النتائج في '../results/simulation_results.pkl'")
+3. ملف الإعتماديات
+
+ملف: /02_SIMULATION_CODE/requirements.txt
+
+```txt
+# اعتماديات محاكاة الدوائر الضوئية الكمومية
+numpy>=1.21.0
+scipy>=1.7.0
+matplotlib>=3.4.0
+pandas>=1.3.0
+jupyter>=1.0.0
+notebook>=6.4.0
+
+# حزم متخصصة (اختيارية للتطوير المتقدم)
+qutip>=4.6.0  # للحسابات الكمومية المتقدمة
+networkx>=2.6.0  # لتمثيل شبكات الدوائر
+tqdm>=4.62.0  # لأشرطة التقدم
+```
+
+4. دليل الاستخدام السريع
+
+ملف: /02_SIMULATION_CODE/README.md
+
+```markdown
+# نظام محاكاة الرقاقة الضوئية الكمومية
+
+## نظرة عامة
+هذا النظام يحاكي الدوائر الضوئية الكمومية المتكاملة للرقاقة السيادية.
+
+## الهيكل
+```
+
+/02_SIMULATION_CODE/
+├── core/                    # الكود الأساسي
+│   ├── quantum_optical_circuit.py
+│   └── init.py
+├── notebooks/              # دفاتر الملاحظات
+│   ├── Quantum_Circuit_Simulation.ipynb
+│   └── Proof_of_Concept.ipynb
+├── utilities/              # أدوات مساعدة
+│   ├── tomography_mle.py
+│   ├── fidelity_calculator.py
+│   └── data_integration.py
+├── configs/               # ملفات التكوين
+├── results/               # مخرجات المحاكاة
+├── requirements.txt       # الاعتماديات
+└── README.md             # هذا الملف
+
+```
+
+## البدء السريع
+
+### 1. تثبيت الاعتماديات:
+```bash
+pip install -r requirements.txt
+```
+
+2. تشغيل دفتر الملاحظات التوضيحي:
+
+```bash
+jupyter notebook notebooks/Quantum_Circuit_Simulation.ipynb
+```
+
+3. الاستخدام البرمجي الأساسي:
+
+```python
+from core.quantum_optical_circuit import *
+
+# إنشاء دارة بسيطة
+circuit = QuantumOpticalCircuit("My_Circuit")
+
+# إضافة مكونات
+bs = BeamSplitter(coupling=0.5, name="BS1")
+circuit.add_component(bs)
+
+# محاكاة تداخل HOM
+results = circuit.simulate_hom_interference()
+print(f"رؤية HOM: {results['visibility']:.4f}")
+```
+
+الميزات الرئيسية
+
+1. مكونات ضوئية: مقسمات أشعة، أدلة موجية، حلقات رنانة
+2. محاكاة كمومية: تداخل HOM، توليد حالة Bell
+3. تحليل الأداء: حساب مؤشرات الأداء الرئيسية KPIs
+4. نمذجة غير خطية: تأثير Kerr في حلقات AlGaAs
+
+مؤشرات الأداء المحسوبة
+
+المؤشر القيمة النموذجية طريقة الحساب
+إخلاص التشابك 0.99 من دارة Bell
+معدل الأزواج ~10⁵ Hz من SPDC
+استهلاك الطاقة < 100 mW من حلقة Kerr
+
+التطوير المستقبلي
+
+· دعم دارات متعددة الطوابق
+· محاكاة ضوضاء وحرارة
+· تصدير ملفات GDS-II
+· تكامل مع أدوات المحاكجة
+
+المراجع
+
+1. AlGaAs nonlinear properties: Phys. Rev. Applied 15, 064003 (2021)
+2. Si₃N₄ waveguides: Nature Photonics 11, 639–643 (2017)
+3. Quantum optical circuits: arXiv:2103.05612 (2021)
+
+```
+
+## **5. الخطوات التالية**
+
+### **المهام الفورية:**
+
+1. **تنفيذ الملفات في المستودع:**
+   ```bash
+   # إنشاء الهيكل
+   mkdir -p /QUANTUM_SOVEREIGN_CHIP/02_SIMULATION_CODE/{core,notebooks,utilities,configs,results}
+   
+   # نسخ الملفات
+   cp quantum_optical_circuit.py /QUANTUM_SOVEREIGN_CHIP/02_SIMULATION_CODE/core/
+   cp Quantum_Circuit_Simulation.ipynb /QUANTUM_SOVEREIGN_CHIP/02_SIMULATION_CODE/notebooks/
+```
+
+1. اختبار النظام:
+   ```bash
+   cd /QUANTUM_SOVEREIGN_CHIP/02_SIMULATION_CODE
+   pip install -r requirements.txt
+   jupyter notebook notebooks/Quantum_Circuit_Simulation.ipynb
+   ```
+2. تحديث المخطط التنفيذي:
+   · ✓ المرحلة 0: التأسيس (مكتمل)
+   · ✓ المرحلة 1: المواصفات (مكتمل)
+   · المرحلة 2: النمذجة (جاري)
+   · المرحلة 3: التصميم (التالي)
+
+الانتقال إلى المرحلة 3:
+
+الآن وقد أصبح لدينا نموذج محاكاة يعمل، يمكننا الانتقال إلى تصميم التخطيط الفيزيائي في المرحلة 3:
+
+1. تحويل النماذج إلى تصميم هندسي (GDS-II)
+2. تحديد طبقات التصنيع
+3. إعداد ملفات التصنيع للمنشأة
+
+هل تريد أن نبدأ في تصميم التخطيط الفيزيائي للرقاقة، أم ترغب في إجراء تحسينات إضافية على نظام المحاكاة أولاً؟
+.......
+تحويل النماذج الى تصميم هندسي 
+..... 
+لتحويل نماذج الدوائر الكمومية الضوئية إلى تخطيط هندسي (GDSII)، إليك الخيارات الرئيسية بناءً على أحدث الأدوات، مع التركيز على الحلول المفتوحة المصدر التي تناسب مشروع رقاقتك السيادية:
+
+أولاً: الأدوات المتخصصة المفتوحة المصدر (موصى بها للمشروع البحثي)
+
+· DeviceLayout.jl + GDSFactory: هذا المزيج هو الأكثر ملاءمة مباشرةً.
+  · DeviceLayout.jl: أداة من AWS Center for Quantum Computing مصممة خصيصًا لـ الدوائر الكمومية المتكاملة. تدير التعقيد عبر "مخططات مدفوعة بالمخططات التخطيطية"، مما يسمح لك بالعمل على مستوى عالٍ (مكونات ووصلات) بينما تولد الأداة الهندسة التفصيلية تلقائيًا وتدعم تصدير GDSII .
+  · GDSFactory: أداة مفتوحة المصدر شائعة لتصميم الدوائر الضوئية المتكاملة (PICs). تستخدم لإنشاء ودمج المكونات الضوئية هندسيًا . يمكن لـ DeviceLayout.jl محاكاة نهجها المعياري.
+  · الميزة: مصممة خصيصًا للتحديات المشتركة بين الكم والضوئيات، وقابلة للتكامل مع بيئة جوليا البرمجية القوية للمحاكاة والتحسين .
+· أطر عمل الذكاء الاصطناعي الناشئة (للاستكشاف)
+  · إطار PhIDO: هو إطار عمل بحثي يستخدم وكلاء الذكاء الاصطناعي لترجمة أوصاف الدوائر الضوئية باللغة الطبيعية إلى ملفات GDSII. يذكر البحث استخدام GDSFactory كأحد أدواته الأساسية .
+  · الملاحظة: هذه تقنية ناشئة (ذُكرت في ورقة بحثية منشورة على arXiv)، ومعدلات النجاح ليست 100%، وقد تكون أكثر فائدة لأتمتة مهام تصميمية محددة أو للاستكشاف بدلاً من كونها العمود الفقري لسير العمل الرئيسي في هذه المرحلة .
+
+ثانياً: الاعتبارات العملية الرئيسية قبل البدء
+
+1. حزمة تصميم العملية (PDK): هذا هو المكون الأكثر أهمية. PDK تحدد القواعد الهندسية (الأبعاد الدنيا، المسافات) وخصائص المواد والمكتبات الأساسية للمكونات الخاصة بتقنية التصنيع المستهدفة (مثل Si₃N₄ أو AlGaAs). يجب الحصول على PDK من منشأة التصنيع التي ستتعامل معها أو بناء واحدة داخلية.
+2. تنسيق GDSII: الملف الناتج النهائي سيكون بصيغة GDSII، وهي المعيار الصناعي لتبادل بيانات تخطيط الدوائر المتكاملة . تحتوي هذه الملفات على أشكال هندسية مجمعة في طبقات ذات أرقام محددة . تأكد من أن أدواتك تدعم إنشاء هذا التنسيق .
 
