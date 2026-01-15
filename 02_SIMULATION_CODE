@@ -22,16 +22,594 @@
 4. تعريف "دون تدخل": يعني عدم إعادة معايرة بارامترات التحكم (التيارات، الفولتية) يدويًا. يُسمح بوجود نظام تحكم مغلق الحلقة (Closed-Loop) يعمل تلقائيًا لتعويض الانزياحات.
 5. تكامل الكاشف (SNSPD): يشكل أكبر تحدي هندسي، حيث يتطلب تبريدًا إلى درجة حالية 2-4 كلفن للتشغيل. قد تتطلب النسخة الأولى وحدة تبريد خارجية، ولكن التصميم يجب أن يكون متوافقًا مع التكامل المبرد في المستقبل.
 
----
+......
+"
+تكامل نظام جمع البيانات مع خوارزمية MLE.
+يتضمن تحميل، تنظيف، وتحويل البيانات التجريبية.
+"""
+import numpy as np
+import pandas as pd
+import json
+from datetime import datetime
+from typing import Dict, Any
 
-الخطوات التالية الفورية للمستودع
+class ExperimentalDataProcessor:
+    """
+    معالج البيانات التجريبية للقياسات الضوئية الكمومية.
+    يدعم تنسيقات ملفات متعددة ويقوم بالتصحيح التلقائي.
+    """
+    
+    def __init__(self, config_path: str = None):
+        """تهيئة المعالج بملف تكوين (اختياري)."""
+        self.config = self._load_config(config_path) if config_path else {}
+        self.calibration_data = {}
+        
+    def _load_config(self, config_path: str) -> Dict:
+        """تحميل تكوين المعالجة من ملف JSON."""
+        with open(config_path, 'r') as f:
+            return json.load(f)
+    
+    def load_from_csv(self, filepath: str, format_type: str = 'standard') -> Dict:
+        """
+        تحميل البيانات من ملف CSV بتنسيقات مختلفة.
+        
+        التنسيقات المدعومة:
+        - 'standard': تنسيقنا القياسي (setting, N_HH, N_HV, N_VH, N_VV, time)
+        - 'labview': تنسيق مخرجات LabView الشائع
+        - 'timing': بيانات بتفاصيل زمنية لكل حدث
+        """
+        df = pd.read_csv(filepath)
+        
+        if format_type == 'standard':
+            return self._parse_standard_format(df)
+        elif format_type == 'labview':
+            return self._parse_labview_format(df)
+        elif format_type == 'timing':
+            return self._parse_timing_format(df)
+        else:
+            raise ValueError(f"تنسيق غير مدعوم: {format_type}")
+    
+    def _parse_standard_format(self, df: pd.DataFrame) -> Dict:
+        """تحليل التنسيق القياسي."""
+        data = {}
+        
+        for _, row in df.iterrows():
+            setting = str(row['setting']).strip().upper()
+            
+            # التحقق من صحة الإعداد (يجب أن يكون 2 أحرف)
+            if len(setting) != 2 or any(c not in 'IXYZ' for c in setting):
+                print(f"تحذير: تخطي إعداد غير صالح: {setting}")
+                continue
+            
+            data[setting] = {
+                'HH': float(row.get('N_HH', 0)),
+                'HV': float(row.get('N_HV', 0)),
+                'VH': float(row.get('N_VH', 0)),
+                'VV': float(row.get('N_VV', 0)),
+                'time': float(row.get('total_time', 10.0)),
+                'timestamp': row.get('timestamp', datetime.now().isoformat())
+            }
+        
+        return data
+    
+    def _parse_labview_format(self, df: pd.DataFrame) -> Dict:
+        """تحليل تنسيق LabView (عادةً أعمدة أكثر)."""
+        # افتراض أن الأعمدة تكون مثل: 'Setting', 'Counts ChA', 'Counts ChB', etc.
+        # يمكنك تخصيص هذا وفقًا لتخطيط ملفك المحدد
+        data = {}
+        
+        for _, row in df.iterrows():
+            setting = str(row['Setting']).strip()
+            
+            # تحويل ترميز LabView إلى ترميزنا (مثال)
+            setting_map = {'HH': 'ZZ', 'HV': 'ZX', 'VH': 'XZ', 'VV': 'XX'}
+            if setting in setting_map:
+                setting = setting_map[setting]
+            
+            data[setting] = {
+                'HH': float(row.get('Coinc HH', 0)),
+                'HV': float(row.get('Coinc HV', 0)),
+                'VH': float(row.get('Coinc VH', 0)),
+                'VV': float(row.get('Coinc VV', 0)),
+                'time': float(row.get('Acquisition Time', 10.0))
+            }
+        
+        return data
+    
+    def _parse_timing_format(self, df: pd.DataFrame) -> Dict:
+        """تحليل بيانات التوقيت التفصيلية (لكل حدث)."""
+        # تجميع البيانات الزمنية إلى إعدادات
+        # هذه دالة متقدمة - تحتاج إلى مزيد من التخصيص
+        data = {}
+        
+        # تجميع الأحداث حسب الإعداد والنتيجة
+        grouped = df.groupby(['setting', 'outcome']).size().reset_index(name='counts')
+        
+        for _, row in grouped.iterrows():
+            setting = str(row['setting'])
+            outcome = str(row['outcome'])
+            counts = int(row['counts'])
+            
+            if setting not in data:
+                data[setting] = {'HH': 0, 'HV': 0, 'VH': 0, 'VV': 0, 'time': 10.0}
+            
+            if outcome in data[setting]:
+                data[setting][outcome] = counts
+        
+        return data
+    
+    def apply_calibration_corrections(self, raw_data: Dict, calibration: Dict = None) -> Dict:
+        """
+        تطبيق تصحيحات المعايرة على البيانات الخام.
+        
+        التصحيحات تشمل:
+        1. طرح الخلفية (Dark Counts)
+        2. تصحيح الكفاءة (Detection Efficiency)
+        3. تصحيح فقدان المسار (Path Loss)
+        4. تصحيح غير الخطية (Non-linearity)
+        """
+        if calibration is None:
+            calibration = self.calibration_data
+        
+        corrected_data = {}
+        
+        for setting, counts in raw_data.items():
+            corrected = counts.copy()
+            
+            # 1. تصحيح الخلفية
+            if 'dark_counts' in calibration:
+                dark_rate = calibration['dark_counts']
+                exposure_time = counts['time']
+                dark_counts = dark_rate * exposure_time
+                
+                for outcome in ['HH', 'HV', 'VH', 'VV']:
+                    corrected[outcome] = max(0, corrected[outcome] - dark_counts)
+            
+            # 2. تصحيح الكفاءة
+            if 'efficiency' in calibration:
+                eff = calibration['efficiency']
+                for outcome in ['HH', 'HV', 'VH', 'VV']:
+                    if corrected[outcome] > 0:
+                        corrected[outcome] = corrected[outcome] / eff
+            
+            # 3. تصحيح فقدان المسار
+            if 'path_loss' in calibration:
+                loss = calibration['path_loss']
+                for outcome in ['HH', 'HV', 'VH', 'VV']:
+                    if corrected[outcome] > 0:
+                        corrected[outcome] = corrected[outcome] * loss
+            
+            corrected_data[setting] = corrected
+        
+        return corrected_data
+    
+    def estimate_statistical_uncertainty(self, data: Dict) -> Dict:
+        """
+        تقدير عدم اليقين الإحصائي بناءً على عدد العدود.
+        
+        يستخدم تقريب بواسوني: σ = √N
+        """
+        uncertainties = {}
+        
+        for setting, counts in data.items():
+            unc = {}
+            for outcome in ['HH', 'HV', 'VH', 'VV']:
+                n = counts[outcome]
+                unc[outcome] = np.sqrt(n) if n > 0 else 0
+            
+            uncertainties[setting] = unc
+        
+        return uncertainties
+    
+    def validate_data_completeness(self, data: Dict) -> bool:
+        """
+        التحقق من اكتمال مجموعة البيانات (جميع الإعدادات الـ ١٦ موجودة).
+                يُرجع True إذا كانت البيانات كاملة، False مع رسائل خطأ تفصيلية.
+        """
+        required_settings = ['II', 'ZI', 'IZ', 'ZZ', 'XI', 'YI', 'XZ', 'YZ',
+                            'IX', 'IY', 'ZX', 'ZY', 'XX', 'XY', 'YX', 'YY']
+        
+        missing = []
+        for setting in required_settings:
+            if setting not in data:
+                missing.append(setting)
+            elif sum(data[setting][outcome] for outcome in ['HH', 'HV', 'VH', 'VV']) == 0:
+                missing.append(f"{setting} (بيانات صفرية)")
+        
+        if missing:
+            print(f"تحذير: الإعدادات الناقصة أو الصفرية: {missing}")
+            print("قد تحتاج إلى جمع المزيد من البيانات لهذه الإعدادات.")
+            return False
+        
+        return True
+    
+    def generate_summary_report(self, data: Dict, output_path: str = None) -> str:
+        """
+        توليد تقرير ملخص عن جودة البيانات.
+        """
+        total_counts = 0
+        total_time = 0
+        settings_count = len(data)
+        
+        for setting, counts in data.items():
+            total_counts += sum(counts[outcome] for outcome in ['HH', 'HV', 'VH', 'VV'])
+            total_time += counts['time']
+        
+        avg_counts_per_setting = total_counts / settings_count if settings_count > 0 else 0
+        avg_time_per_setting = total_time / settings_count if settings_count > 0 else 0
+        
+        report = f"""
+        تقرير جودة البيانات
+        =====================
+        الوقت: {datetime.now().isoformat()}
+        
+        الإحصائيات العامة:
+        - عدد الإعدادات: {settings_count}/16
+        - إجمالي العدود: {total_counts:,}
+        - إجمالي زمن القياس: {total_time:.1f} ثانية
+        - متوسط العدود لكل إعداد: {avg_counts_per_setting:.0f}
+        - متوسط الزمن لكل إعداد: {avg_time_per_setting:.1f} ثانية
+        
+        تقييم الجودة:
+        """
+        
+        # قياس نسبة الإشارة إلى الضوضاء (SNR) التقريبية
+        if settings_count > 0:
+            sample_setting = list(data.keys())[0]
+            sample_counts = data[sample_setting]
+            max_count = max(sample_counts.values())
+            min_count = min(sample_counts.values())
+            
+            if min_count > 0:
+                snr_approx = max_count / min_count
+                report += f"- نسبة الإشارة إلى الضوضاء التقريبية: {snr_approx:.1f}\n"
+            
+            # حساب عدم اليقين الإحصائي النسبي
+            rel_uncertainty = np.sqrt(max_count) / max_count if max_count > 0 else 0
+            report += f"- عدم اليقين الإحصائي النسبي: {rel_uncertainty:.2%}\n"
+        
+        if output_path:
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write(report)
+        
+        return report
+```
 
-1. إنشاء ملف تفصيلي للبروتوكولات:
-   · المسار: /04_CHARACTERIZATION_DATA/protocols/
-   · الملفات: QST_Protocol.md، Coincidence_Rate_Measurement.md، Power_Measurement_Procedure.md.
-2. تطوير كود مساعد للتحليل:
-   · المسار: /02_SIMULATION_CODE/utilities/
-   · الملفات: fidelity_calculator.py، coincidence_analyzer.py (لمعالجة بيانات التزامن الخام).
-3. إضافة افتراضات التصميم إلى MATHEMATICAL_FRAMEWORK:
-   · تضمين حسابات التنبؤ بمقدار الإخلاص بناءً على خسائر القناة (η)، ورؤية HOM (V)، وكفاءة الكشف.
+٢. تكييف خوارزمية MLE للبيانات الواقعية
+
+تعديلات على tomography_mle.py:
+
+```python
+# أضف هذه الوظائف الجديدة في نهاية الملف
+
+class ExperimentalTomography:
+    """
+    واجهة متكاملة لاستعادة الحالة من البيانات التجريبية.
+    """
+    def __init__(self, config: Dict = None):
+        self.processor = ExperimentalDataProcessor()
+        self.results = {}
+        
+        if config:
+            self.load_config(config)
+    
+    def load_config(self, config: Dict):
+        """تحميل إعدادات التحليل."""
+        self.config = config
+        
+        # تحميل بيانات المعايرة إذا وجدت
+        if 'calibration_file' in config:
+            with open(config['calibration_file'], 'r') as f:
+                self.calibration_data = json.load(f)
+    
+    def analyze_experiment(self, data_file: str, data_format: str = 'standard') -> Dict:
+        """
+        تحليل تجربة كاملة من تحميل البيانات إلى استعادة الحالة.
+        """
+        print(f"تحليل البيانات من: {data_file}")
+        
+        # 1. تحميل البيانات الخام
+        raw_data = self.processor.load_from_csv(data_file, data_format)
+        
+        # 2. التحقق من اكتمال البيانات
+        if not self.processor.validate_data_completeness(raw_data):
+            print("تحذير: البيانات غير مكتملة، قد تتأثر دقة النتائج.")
+        
+        # 3. تطبيق تصحيحات المعايرة
+        if hasattr(self, 'calibration_data'):
+            corrected_data = self.processor.apply_calibration_corrections(
+                raw_data, self.calibration_data
+            )
+        else:
+            corrected_data = raw_data
+            print("ملاحظة: لم تطبق تصحيحات المعايرة.")
+        
+        # 4. تقدير عدم اليقين الإحصائي
+        uncertainties = self.processor.estimate_statistical_uncertainty(corrected_data)
+        
+        # 5. استعادة الحالة باستخدام MLE
+        print("بدء استعادة الحالة باستخدام خوارزمية MLE...")
+        rho_estimated, mle_info = rho_mle_rhr(
+            corrected_data,
+            max_iter=self.config.get('max_iterations', 500),
+            tol=self.config.get('tolerance', 1e-8)
+        )
+        
+        # 6. حساب مؤشرات الجودة
+        psi_target = create_bell_state('psi_minus')
+        rho_target = psi_target.reshape(-1, 1) @ psi_target.conj().reshape(1, -1)
+        
+        fidelity = np.real(np.trace(rho_target @ rho_estimated))
+        concurrence = compute_concurrence(rho_estimated)
+        purity = np.real(np.trace(rho_estimated @ rho_estimated))
+        
+        # 7. حساب عدم اليقين باستخدام Bootstrap
+        print("حساب عدم اليقين باستخدام Bootstrap...")
+        bootstrap_results = compute_uncertainty_bootstrap(
+            rho_estimated, 
+            corrected_data,
+            n_resamples=self.config.get('n_bootstrap', 500)
+        )
+        
+        # 8. تجميع النتائج
+        self.results = {
+            'rho_estimated': rho_estimated,
+            'fidelity': fidelity,
+            'fidelity_uncertainty': bootstrap_results['fidelity_std'],
+            'concurrence': concurrence,
+            'concurrence_uncertainty': bootstrap_results['concurrence_std'],
+            'purity': purity,
+            'mle_info': mle_info,
+            'bootstrap_results': bootstrap_results,
+            'data_summary': self.processor.generate_summary_report(corrected_data),
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        return self.results
+    
+    def save_results(self, output_dir: str = './results'):
+        """
+        حفظ جميع النتائج في ملفات منظمة.
+        """
+        import os
+        os.makedirs(output_dir, exist_ok=True)
+        
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        
+        # 1. حفظ مصفوفة الكثافة
+        np.save(f'{output_dir}/rho_estimated_{timestamp}.npy', 
+                self.results['rho_estimated'])
+        
+        # 2. حفظ التقرير النصي
+        report = self._generate_full_report()
+        with open(f'{output_dir}/report_{timestamp}.txt', 'w', encoding='utf-8') as f:
+            f.write(report)
+        
+        # 3. حفظ البيانات المنظمة (JSON)
+        json_data = {
+            'fidelity': float(self.results['fidelity']),
+            'fidelity_uncertainty': float(self.results['fidelity_uncertainty']),
+            'concurrence': float(self.results['concurrence']),
+            'concurrence_uncertainty': float(self.results['concurrence_uncertainty']),
+            'purity': float(self.results['purity']),
+            'timestamp': self.results['timestamp']
+        }
+        
+        with open(f'{output_dir}/results_{timestamp}.json', 'w') as f:
+            json.dump(json_data, f, indent=2)
+        
+        print(f"تم حفظ النتائج في: {output_dir}")
+    
+    def _generate_full_report(self) -> str:
+        """توليد تقرير تحليل كامل."""
+        report = f"""
+        تقرير استعادة الحالة الكمومية
+        ==============================
+        تاريخ التحليل: {self.results['timestamp']}
+        
+        النتائج الرئيسية:
+        -----------------
+        الإخلاص (Fidelity): {self.results['fidelity']:.6f} ± {self.results['fidelity_uncertainty']:.6f}
+        درجة التشابك (Concurrence): {self.results['concurrence']:.6f} ± {self.results['concurrence_uncertainty']:.6f}
+        النقاء (Purity): {self.results['purity']:.6f}
+        
+        معلومات خوارزمية MLE:
+        ---------------------
+        عدد التكرارات: {self.results['mle_info']['iterations']}
+        القيم الذاتية النهائية: {np.real(self.results['mle_info']['eigenvalues'])}
+        
+        {self.results['data_summary']}
+        
+        توصيات:
+        -------
+        """
+        
+        # توصيات بناءً على النتائج
+        if self.results['fidelity'] > 0.99:
+            report += "- ✓ الإخلاص ممتاز (> 0.99).\n"
+        elif self.results['fidelity'] > 0.95:
+            report += "- الإخلاص جيد (> 0.95).\n"
+        else:
+            report += "- ⚠ الإخلاص بحاجة إلى تحسين.\n"
+        
+        if self.results['fidelity_uncertainty'] < 0.01:
+            report += "- ✓ عدم اليقين منخفض (< 0.01).\n"
+        else:
+            report += "- ⚠ عدم اليقين مرتفع، قد تحتاج إلى مزيد من البيانات.\n"
+        
+        return report
+
+# دالة مساعدة للاستخدام المباشر
+def analyze_experimental_data(data_file: str, 
+                             config_file: str = None,
+                             output_dir: str = './results') -> Dict:
+    """
+    دالة عالية المستوى لتحليل البيانات التجريبية.
+    """
+    # تحميل الإعدادات إذا وجدت
+    config = {}
+    if config_file:
+        with open(config_file, 'r') as f:
+            config = json.load(f)
+    
+    # إنشاء محلل وتشغيل التحليل
+
+analyzer = ExperimentalTomography(config)
+    results = analyzer.analyze_experiment(data_file)
+    
+    # حفظ النتائج
+    analyzer.save_results(output_dir)
+    
+    return results
+```
+
+٣. اختبار التكامل مع بيانات محاكاة واقعية
+
+ملف: /02_SIMULATION_CODE/notebooks/test_experimental_integration.ipynb
+
+```python
+# اختبار التكامل الكامل لنظام MLE مع البيانات التجريبية
+
+import sys
+sys.path.append('../utilities')
+
+from data_integration import ExperimentalDataProcessor
+from tomography_mle import analyze_experimental_data, generate_simulated_data
+import json
+import tempfile
+import os
+
+# 1. إنشاء بيانات محاكاة واقعية
+print("1. إنشاء بيانات محاكاة واقعية...")
+realistic_data = {}
+
+# إضافة ضوضاء واقعية وتفاوت في العدود
+for setting in ['II', 'ZI', 'IZ', 'ZZ', 'XI', 'YI', 'XZ', 'YZ',
+                'IX', 'IY', 'ZX', 'ZY', 'XX', 'XY', 'YX', 'YY']:
+    # توليد عدود مع ضوضاء بواسونية وتفاوت زمني
+    base_counts = 50000  # متوسط العدود
+    noise_level = 0.05   # 5% ضوضاء
+    
+    realistic_data[setting] = {
+        'HH': int(np.random.poisson(base_counts * (1 + np.random.uniform(-noise_level, noise_level)))),
+        'HV': int(np.random.poisson(base_counts * (1 + np.random.uniform(-noise_level, noise_level)))),
+        'VH': int(np.random.poisson(base_counts * (1 + np.random.uniform(-noise_level, noise_level)))),
+        'VV': int(np.random.poisson(base_counts * (1 + np.random.uniform(-noise_level, noise_level)))),
+        'time': 10.0 + np.random.uniform(-0.5, 0.5)  # تفاوت زمني
+    }
+
+# 2. حفظ البيانات في ملف CSV (مثل البيانات التجريبية)
+print("2. حفظ البيانات في ملف CSV...")
+import csv
+
+temp_dir = tempfile.mkdtemp()
+data_file = os.path.join(temp_dir, 'experimental_data.csv')
+
+with open(data_file, 'w', newline='') as f:
+    writer = csv.writer(f)
+    writer.writerow(['setting', 'N_HH', 'N_HV', 'N_VH', 'N_VV', 'total_time'])
+    
+    for setting, counts in realistic_data.items():
+        writer.writerow([
+            setting,
+            counts['HH'],
+            counts['HV'],
+            counts['VH'],
+            counts['VV'],
+            counts['time']
+        ])
+
+print(f"تم إنشاء ملف البيانات في: {data_file}")
+
+# 3. إنشاء ملف تكوين للتحليل
+print("3. إنشاء ملف التكوين...")
+config = {
+    "max_iterations": 300,
+    "tolerance": 1e-7,
+    "n_bootstrap": 200,
+    "calibration": {
+        "dark_counts": 50,  # عددة/ثانية
+        "efficiency": 0.85, # كفاءة الكشف
+        "path_loss": 1.2    # تعويض الفقد
+    }
+}
+
+config_file = os.path.join(temp_dir, 'analysis_config.json')
+with open(config_file, 'w') as f:
+    json.dump(config, f, indent=2)
+
+# 4. تشغيل التحليل الكامل
+print("4. تشغيل التحليل التجريبي الكامل...")
+results = analyze_experimental_data(
+    data_file=data_file,
+    config_file=config_file,
+    output_dir=temp_dir
+)
+
+# 5. عرض النتائج
+print("\n" + "="*60)
+print("نتائج التحليل التجريبي:")
+print("="*60)
+print(f"الإخلاص: {results['fidelity']:.6f} ± {results['fidelity_uncertainty']:.6f}")
+print(f"درجة التشابك: {results['concurrence']:.6f} ± {results['concurrence_uncertainty']:.6f}")
+print(f"النقاء: {results['purity']:.6f}")
+
+# 6. التحقق من ملفات النتائج
+print("\n" + "="*60)
+print("الملفات المنشأة:")
+for file in os.listdir(temp_dir):
+    if file.endswith(('.npy', '.txt', '.json')):
+        print(f"  - {file}")
+
+print(f"\nيمكنك العثور على جميع الملفات في: {temp_dir}")
+```
+
+٤. ملف التكوين النموذجي
+
+ملف: /02_SIMULATION_CODE/configs/tomography_config.json
+
+```
+{
+    "experiment_name": "QST_Bell_State_Measurement",
+    "date": "2024-01-01",
+    
+    "algorithm_parameters": {
+        "max_iterations": 500,
+        "tolerance": 1e-8,
+        "initial_rho": "maximally_mixed",
+        "regularization": "positive_semidefinite"
+    },
+    
+    "uncertainty_estimation": {
+        "method": "bootstrap",
+        "n_resamples": 1000,
+        "confidence_level": 0.95
+    },
+    
+    "calibration_corrections": {
+        "apply_dark_count_correction": true,
+        "apply_efficiency_correction": true,
+        "apply_path_loss_correction": true,
+        "dark_count_rate": 50.0,
+        "detection_efficiency": 0.82,
+        "path_loss_factor": 1.15
+    },
+    
+    "data_requirements": {
+        "minimum_counts_per_setting": 10000,
+        "minimum_settings": 16,
+        "required_settings": [
+            "II", "ZI", "IZ", "ZZ", "XI", "YI", "XZ", "YZ",
+            "IX", "IY", "ZX", "ZY", "XX", "XY", "YX", "YY"
+        ]
+    },
+    
+    "output_settings": {
+        "save_rho_matrix": true,
+        "save_report": true,
+        "save_plots": true,
+        "output_format": "json",
+        "plots_format": "png"
+    }
+}
 
