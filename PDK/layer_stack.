@@ -1,0 +1,54 @@
+json
+{
+  "name": "QSOC_PDK_v1.0",
+  "technology": "Hybrid_Si3N4_AlGaAs",
+  "description": "PDK للرقاقة الكمومية السيادية - هجين Si3N4/AlGaAs",
+  
+  "layers": [
+    {
+      "name": "WAVEGUIDE_CORE",
+      "layer_number": 1,
+      "datatype": 0,
+      "material": "Si3N4",
+      "thickness_nm": 220,
+      "width_min_nm": 400,
+      "width_typical_nm": 500,
+      "purpose": "الدليل الموجي الأساسي للدوائر الخطية"
+    },
+    {
+      "name": "NONLINEAR_CORE",
+      "layer_number": 2,
+      "datatype": 0,
+      "material": "AlGaAs",
+      "thickness_nm": 300,
+      "width_min_nm": 450,
+      "width_typical_nm": 500,
+      "purpose": "الدليل الموجي للعناصر غير الخطية (حلقات Kerr)"
+    },
+    {
+      "name": "METAL_HEATER",
+      "layer_number": 10,
+      "datatype": 0,
+      "material": "TiN",
+      "thickness_nm": 50,
+      "width_min_nm": 300,
+      "purpose": "مسخنات نانوية للتحكم بالطور"
+    },
+    {
+      "name": "VIAS",
+      "layer_number": 11,
+      "datatype": 0,
+      "material": "Ti/TiN",
+      "purpose": "وصلات بين الطبقات"
+    }
+  ],
+  
+  "design_rules": {
+    "min_waveguide_spacing_nm": 300,
+    "min_bend_radius_um": 5.0,
+    "max_waveguide_length_um": 10000,
+    "coupling_gap_min_nm": 150,
+    "ring_resonator_radius_min_um": 3.0
+  }
+}
+```
