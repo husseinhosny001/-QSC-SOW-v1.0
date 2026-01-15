@@ -1,1 +1,17 @@
+    ├── PDK/                          # حزمة تصميم العملية (الأساس)
+    │   ├── layer_stack.json         # تعريف طبقات التصنيع
+    │   ├── design_rules.yaml        # قواعد التصميم (DRC)
+    │   └── techfile.gds             # ملف التقنية (مرجعي)
+    ├── component_library/           # مكتبة المكونات الهندسية
+    │   ├── waveguide.py
+    │   ├── beam_splitter.py
+    │   ├── ring_resonator.py
+    │   └── phase_shifter.py
+    ├── layouts/                     # ملفات التخطيط الفعلية
+    │   ├── main_chip.gds
+    │   └── submodules/
+    └── scripts/                     # سكريبتات التوليد والتحقق
+        ├── generate_layout.py
+        └── run_drc_checks.py
+```
 
