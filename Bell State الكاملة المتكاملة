@@ -1,0 +1,733 @@
+تصميم دارة Bell State الكاملة المتكاملة
+
+🎯 دارة توليد وتشابك حالة Bell الكمومية
+
+ملف: /03_FABRICATION/component_library/bell_state_generator.py
+
+```python
+"""
+دارة متكاملة لتوليد حالة Bell الكمومية |Ψ⁻⟩ على رقاقة واحدة.
+تدمج: مصادر SPDC، مقسمات أشعة، مسخنات حرارية، وكواشف.
+"""
+import numpy as np
+import gdspy
+import yaml
+from typing import Tuple, List, Dict, Optional
+import json
+import sys
+import os
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from component_library.programmable_mzi import ProgrammableMZI
+from component_library.thermal_phase_shifter import ThermalPhaseShifter, HeaterMaterial
+from component_library.waveguide import QuantumWaveguide
+
+class BellStateGenerator:
+    """
+    دارة كمومية متكاملة لتوليد حالة Bell |Ψ⁻⟩ = (|HV⟩ - |VH⟩)/√2
+    
+    المخطط:
+        Pump Laser → SPDC Source → Polarization Splitting → MZI Network → Output
+    """
+    
+    def __init__(self,
+                 chip_size: Tuple[float, float] = (500, 500),  # μm
+                 wavelength: float = 1.55,  # μm
+                 material: str = "AlGaAs",
+                 layer_spdc: int = 2,  # طبقة العناصر غير الخطية
+                 layer_waveguide: int = 1,
+                 layer_heater: int = 10,
+                 layer_detector: int = 20):
+        
+        self.chip_size = chip_size
+        self.wavelength = wavelength
+        self.material = material
+        
+        # الطبقات
+        self.layer_spdc = layer_spdc
+        self.layer_waveguide = layer_waveguide
+        self.layer_heater = layer_heater
+        self.layer_detector = layer_detector
+        
+        # إنشاء المكونات الفرعية
+        self.waveguide = QuantumWaveguide(width=0.5, layer=layer_waveguide)
+        self.heater = ThermalPhaseShifter(
+            material=HeaterMaterial.TIN,
+            width=0.5,
+            thickness=0.05,
+            layer_heater=layer_heater,
+            layer_waveguide=layer_waveguide,
+            layer_via=11
+        )
+        
+        # تحميل قواعد التصميم
+        with open('../PDK/design_rules.yaml', 'r') as f:
+            self.drc = yaml.safe_load(f)
+        
+        # معاملات فيزيائية
+        self._calculate_quantum_properties()
+    
+    def _calculate_quantum_properties(self):
+        """حساب الخصائص الكمومية المتوقعة."""
+        # كفاءة توليد أزواج فوتونات (SPDC)
+        # P_pair = η * P_pump² * L² * χ²
+        self.spdc_efficiency = 1e-8  # أزواج/فوتون مضخ
+        self.pair_generation_rate_hz = 1e5  # عند 10 mW pump
+        
+        # نقاء التشابك المتوقع
+        self.expected_entanglement_purity = 0.95
+        self.expected_fidelity = 0.98
+        
+        # معدل العدود المتوقع
+        self.detection_efficiency = 0.8
+        self.expected_coincidence_rate_hz = self.pair_generation_rate_hz * self.detection_efficiency**2
+    
+    def create_complete_circuit(self) -> gdspy.Cell:
+        """
+        إنشاء الدارة الكاملة لتوليد حالة Bell.
+        
+        المكونات:
+        1. مصدر SPDC غير خطي
+        2. فصل الاستقطاب
+        3. شبكة MZI للتحكم بالطور
+        4. منطق التشابك (Bell State Measurement)
+        5. مناطق الكشف
+        """
+        cell = gdspy.Cell("Bell_State_Generator_v1")
+        
+        # 1. منطقة مصدر SPDC
+        spdc_region = self._create_spdc_source((50, 250))
+        cell.add(spdc_region)
+        
+        # 2. فصل الاستقطاب إلى قناتين
+        polarization_splitter = self._create_polarization_splitter((150, 250))
+        cell.add(polarization_splitter)
+        
+        # 3. مسارات الفوتونات المتشابكة
+        photon_paths = self._create_entangled_photon_paths((250, 250))
+        cell.add(photon_paths)
+        
+        # 4. شبكة MZI للتحكم بالطور والتشابك
+        mzi_network = self._create_mzi_entanglement_network((350, 250))
+        cell.add(mzi_network)
+        
+        # 5. مناطق الكواشف
+        detectors = self._create_quantum_detectors((450, 250))
+        cell.add(detectors)
+        
+        # 6. بنية تحكم واتصال
+        control_circuitry = self._create_control_circuitry()
+        cell.add(control_circuitry)
+        
+        # 7. إضافة الحدود والتسميات
+        border = self._create_chip_border()
+        cell.add(border)
+        
+        labels = self._add_circuit_labels()
+        for label in labels:
+            cell.add(label)
+        
+        return cell
+    
+    def _create_spdc_source(self, center: Tuple[float, float]) -> gdspy.PolygonSet:
+        """
+        إنشاء مصدر أزواج فوتونات متشابكة عبر SPDC.
+        
+        التصميم: حلقة رنانة غير خطية من AlGaAs.
+        """
+        # أبعاد الحلقة الرنانة
+        ring_radius = 20.0  # μm
+        ring_width = 0.5    # μm
+        bus_waveguide_offset = 0.2  # μm
+        
+        # إنشاء الحلقة الرئيسية
+        ring_circle = self._create_ring_resonator(center, ring_radius, ring_width)
+        
+        # دليل الحافلة (Bus Waveguide) للضخ
+        bus_start = (center[0] - ring_radius - 10, center[1] + ring_radius + bus_waveguide_offset)
+        bus_end = (center[0] + ring_radius + 10, center[1] + ring_radius + bus_waveguide_offset)
+        bus_waveguide = self.waveguide.create_straight(bus_start, bus_end)
+        
+        # منطقة الاقتران
+        coupling_length = 5.0
+        coupling_center = (center[0], center[1] + ring_radius + bus_waveguide_offset/2)
+        coupling_region = gdspy.Rectangle(
+            (coupling_center[0] - coupling_length/2, coupling_center[1] - 0.25),
+            (coupling_center[0] + coupling_length/2, coupling_center[1] + 0.25),
+            layer=self.layer_spdc
+        )
+        
+        # إضافة تسمية
+        label = gdspy.Label(
+            f"SPDC_Source\nR={ring_radius}μm\n{self.material}",
+            (center[0], center[1] - ring_radius - 5),
+            layer=self.layer_spdc + 100
+        )
+        
+        # تجميع المكونات
+        spdc_source = gdspy.boolean([ring_circle, bus_waveguide, coupling_region], None, 'or')
+        return spdc_source, label
+    
+    def _create_ring_resonator(self, center: Tuple[float, float], 
+                              radius: float, width: float) -> gdspy.PolygonSet:
+        """إنشاء حلقة رنانة دائرية."""
+        # تقريب الحلقة بمضلع ذو عدد كبير من الجوانب
+        num_points = 128
+        angles = np.linspace(0, 2*np.pi, num_points, endpoint=False)
+        
+        # النقاط الخارجية
+        outer_points = []
+        for angle in angles:
+            x = center[0] + (radius + width/2) * np.cos(angle)
+            y = center[1] + (radius + width/2) * np.sin(angle)
+            outer_points.append((x, y))
+        
+        # النقاط الداخلية (معكوسة)
+        inner_points = []
+        for angle in angles[::-1]:
+            x = center[0] + (radius - width/2) * np.cos(angle)
+            y = center[1] + (radius - width/2) * np.sin(angle)
+            inner_points.append((x, y))
+        
+        # دمج النقاط لتشكيل مضلع حلقي
+        polygon_points = outer_points + inner_points
+        
+        return gdspy.Polygon(polygon_points, layer=self.layer_spdc)
+    
+    def _create_polarization_splitter(self, center: Tuple[float, float]) -> gdspy.PolygonSet:
+        """
+        إنشاء مقسم استقطاب لفصل |H⟩ و |V⟩.
+        
+        التصميم: مقسم أشعة غير متماثل مع معالج استقطاب.
+        """
+        # أبعاد مقسم الاستقطاب
+        length = 30.0
+        width = 2.0
+        
+        # الجسم الرئيسي
+        splitter_body = gdspy.Rectangle(
+            (center[0] - length/2, center[1] - width/2),
+            (center[0] + length/2, center[1] + width/2),
+            layer=self.layer_waveguide
+        )
+        
+        # منطقة الانقسام
+        split_angle = np.pi/4  # 45 درجة
+        
+        # الذراع H (أفقي)
+        h_arm_start = (center[0] + length/2, center[1])
+        h_arm_end = (center[0] + length/2 + 20, center[1])
+        h_arm = self.waveguide.create_straight(h_arm_start, h_arm_end)
+        
+        # الذراع V (عمودي)
+        v_arm_start = (center[0], center[1] + width/2)
+        v_arm_end = (center[0], center[1] + width/2 + 20)
+        v_arm = self.waveguide.create_straight(v_arm_start, v_arm_end)
+        
+        # إضافة مرشحات استقطاب (تمثيلية)
+        h_filter = gdspy.Rectangle(
+            (h_arm_end[0] - 2, h_arm_end[1] - 1),
+            (h_arm_end[0] + 2, h_arm_end[1] + 1),
+            layer=self.layer_waveguide
+        )
+        
+        v_filter = gdspy.Rectangle(
+            (v_arm_end[0] - 1, v_arm_end[1] - 2),
+            (v_arm_end[0] + 1, v_arm_end[1] + 2),
+            layer=self.layer_waveguide
+        )
+        
+        # تسمية
+        label = gdspy.Label(
+            "Polarization\nSplitter",
+            (center[0], center[1] - width/2 - 5),
+            layer=self.layer_waveguide + 100
+        )
+        
+        # تجميع
+        components = [splitter_body, h_arm, v_arm, h_filter, v_filter, label]
+        return gdspy.boolean(components, None, 'or')
+    
+    def _create_entangled_photon_paths(self, start_point: Tuple[float, float]) -> gdspy.Cell:
+        """
+        إنشاء المسارات لفوتونين متشابكين.
+        
+        مساران متوازيان مع مقسمات أشعة للتحكم.
+        """
+        cell = gdspy.Cell("Entangled_Paths")
+        
+        # المسار العلوي (الفوتون 1)
+        top_path_y = start_point[1] + 10
+        top_path_start = (start_point[0], top_path_y)
+        top_path_end = (start_point[0] + 80, top_path_y)
+        
+        top_waveguide = self.waveguide.create_straight(top_path_start, top_path_end)
+        cell.add(top_waveguide)
+        
+        # المسار السفلي (الفوتون 2)
+        bottom_path_y = start_point[1] - 10
+        bottom_path_start = (start_point[0], bottom_path_y)
+        bottom_path_end = (start_point[0] + 80, bottom_path_y)
+        
+        bottom_waveguide = self.waveguide.create_straight(bottom_path_start, bottom_path_end)
+        cell.add(bottom_waveguide)
+        
+        # مقسم أشعة بين المسارين للتحكم بالتشابك
+        bs_center = (start_point[0] + 40, start_point[1])
+        bs_coupler = self._create_directional_coupler(bs_center, length=20, gap=0.15)
+        cell.add(bs_coupler)
+        
+        # مسخنان للتحكم بالطور النسبي
+        top_heater_start = (start_point[0] + 20, top_path_y + 1)
+        top_heater = self.heater.create_heater_structure(
+            start=top_heater_start,
+            length=40,
+            waveguide_below=True
+        )
+        cell.add(top_heater)
+        
+        bottom_heater_start = (start_point[0] + 20, bottom_path_y - 1)
+        bottom_heater = self.heater.create_heater_structure(
+            start=bottom_heater_start,
+            length=40,
+            waveguide_below=True
+        )
+        cell.add(bottom_heater)
+        
+        # تسمية المسارات
+        cell.add(gdspy.Label("Photon 1 Path", 
+                           (start_point[0] + 40, top_path_y + 3),
+                           layer=self.layer_waveguide + 100))
+        
+        cell.add(gdspy.Label("Photon 2 Path", 
+                           (start_point[0] + 40, bottom_path_y - 3),
+                           layer=self.layer_waveguide + 100))
+        
+        return cell
+    
+    def _create_directional_coupler(self, center: Tuple[float, float], 
+                                   length: float, gap: float) -> gdspy.PolygonSet:
+        """إنشاء مقسم شعاع اتجاهي."""
+        wg_width = 0.5
+        
+        # الدليل العلوي
+        upper_wg = gdspy.Rectangle(
+            (center[0] - length/2, center[1] + gap/2 - wg_width/2),
+            (center[0] + length/2, center[1] + gap/2 + wg_width/2),
+            layer=self.layer_waveguide
+        )
+        
+        # الدليل السفلي
+        lower_wg = gdspy.Rectangle(
+            (center[0] - length/2, center[1] - gap/2 - wg_width/2),
+            (center[0] + length/2, center[1] - gap/2 + wg_width/2),
+            layer=self.layer_waveguide
+        )
+        
+        return gdspy.boolean([upper_wg, lower_wg], None, 'or')
+    
+    def _create_mzi_entanglement_network(self, center: Tuple[float, float]) -> gdspy.Cell:
+        """
+        إنشاء شبكة MZI لإنتاج حالة Bell.
+        
+        المخطط:
+            |H⟩ → MZI1 → Output1
+            |V⟩ → MZI2 → Output2
+        مع وصلات متقاطعة لإنتاج التشابك.
+        """
+        cell = gdspy.Cell("MZI_Entanglement_Network")
+        
+        # MZI الأول (للاستقطاب H)
+        mzi1 = ProgrammableMZI(
+            coupling=0.5,
+            arm_length=100,
+            arm_spacing=8
+        )
+        
+        mzi1_cell = mzi1.create_mzi_cell(
+            start_point=(center[0] - 60, center[1] + 15),
+            include_heaters=True,
+            symmetric_heaters=True
+        )
+        cell.add(mzi1_cell)
+        
+        # MZI الثاني (للاستقطاب V)
+        mzi2 = ProgrammableMZI(
+            coupling=0.5,
+            arm_length=100,
+            arm_spacing=8
+        )
+        
+        mzi2_cell = mzi2.create_mzi_cell(
+            start_point=(center[0] - 60, center[1] - 25),
+            include_heaters=True,
+            symmetric_heaters=True
+        )
+        cell.add(mzi2_cell)
+        
+        # وصلة تقاطع بين MZI لإنتاج التشابك
+        cross_coupler = self._create_bell_state_cross_coupler(
+            (center[0] + 50, center[1])
+        )
+        cell.add(cross_coupler)
+        
+        # وصلات بين MZI والتقاطع
+        connections = self._create_entanglement_connections(
+            mzi1_position=(center[0] - 60, center[1] + 15),
+            mzi2_position=(center[0] - 60, center[1] - 25),
+            cross_position=(center[0] + 50, center[1])
+        )
+        
+        for connection in connections:
+            cell.add(connection)
+        
+        # تسمية
+        cell.add(gdspy.Label("Bell State\nEntangler",
+                           (center[0], center[1] + 30),
+                           layer=self.layer_waveguide + 100))
+        
+        return cell
+    
+    def _create_bell_state_cross_coupler(self, center: Tuple[float, float]) -> gdspy.PolygonSet:
+        """
+        إنشاء مقسم شعاع متقاطع لإنتاج حالة Bell.
+        
+        التصميم: مقسمان أشعة عموديان على بعضهما.
+        """
+        # المقسم الأفقي
+        horizontal_coupler = self._create_directional_coupler(
+            center=center,
+            length=20,
+            gap=0.15
+        )
+        
+        # المقسم العمودي (مدور 90 درجة)
+        vertical_center = (center[0], center[1])
+        vertical_coupler = gdspy.Rectangle(
+            (vertical_center[0] - 0.25, vertical_center[1] - 10),
+            (vertical_center[0] + 0.25, vertical_center[1] + 10),
+            layer=self.layer_waveguide
+        )
+        
+        # المنطقة المركزية للتقاطع
+        cross_region = gdspy.Rectangle(
+            (center[0] - 1, center[1] - 1),
+            (center[0] + 1, center[1] + 1),
+            layer=self.layer_waveguide
+        )
+        
+        return gdspy.boolean([horizontal_coupler, vertical_coupler, cross_region], 
+                           None, 'or')
+    
+    def _create_entanglement_connections(self, mzi1_position: Tuple[float, float],
+                                        mzi2_position: Tuple[float, float],
+                                        cross_position: Tuple[float, float]) -> List[gdspy.PolygonSet]:
+        """إنشاء وصلات التشابك بين MZI والمقسم المتقاطع."""
+        connections = []
+        
+        # من MZI1 إلى التقاطع (مسار علوي)
+        start1 = (mzi1_position[0] + 80, mzi1_position[1] + 10)
+        end1 = (cross_position[0] - 10, cross_position[1] + 5)
+        conn1 = self.waveguide.create_straight(start1, end1)
+        connections.append(conn1)
+        
+        # من MZI1 إلى التقاطع (مسار سفلي)
+        start2 = (mzi1_position[0] + 80, mzi1_position[1] - 10)
+        end2 = (cross_position[0] - 10, cross_position[1] - 5)
+        conn2 = self.waveguide.create_straight(start2, end2)
+        connections.append(conn2)
+        
+        # من MZI2 إلى التقاطع
+        start3 = (mzi2_position[0] + 80, mzi2_position[1] + 10)
+        end3 = (cross_position[0] - 10, cross_position[1] + 2)
+        conn3 = self.waveguide.create_s_bend(start3, end3, offset=3)
+        for component in conn3:
+            connections.append(component)
+        
+        start4 = (mzi2_position[0] + 80, mzi2_position[1] - 10)
+        end4 = (cross_position[0] - 10, cross_position[1] - 2)
+        conn4 = self.waveguide.create_s_bend(start4, end4, offset=-3)
+        for component in conn4:
+            connections.append(component)
+        
+        return connections
+    
+    def _create_quantum_detectors(self, center: Tuple[float, float]) -> gdspy.Cell:
+        """
+        إنشاء مناطق كشف الفوتونات المفردة.
+        
+        تمثيل مناطق الكواشف الفائقة التوصيل (SNSPD).
+        """
+        cell = gdspy.Cell("Quantum_Detectors")
+        
+        # أربعة كواشف لمقاييس Bell
+        detector_positions = [
+            (center[0], center[1] + 15),    # D1
+            (center[0], center[1] + 5),     # D2
+            (center[0], center[1] - 5),     # D3
+            (center[0], center[1] - 15)     # D4
+        ]
+        
+        for i, pos in enumerate(detector_positions):
+            # منطقة الكشف الرئيسية
+            detector = gdspy.Rectangle(
+                (pos[0] - 3, pos[1] - 2),
+                (pos[0] + 3, pos[1] + 2),
+                layer=self.layer_detector
+            )
+            cell.add(detector)
+            
+            # وصلات كهربائية للقراءة
+            contact_pad = gdspy.Rectangle(
+                (pos[0] + 4, pos[1] - 1),
+                (pos[0] + 8, pos[1] + 1),
+                layer=self.layer_heater
+            )
+            cell.add(contact_pad)
+            
+            # تسمية
+            cell.add(gdspy.Label(f"D{i+1}",
+                               (pos[0] - 5, pos[1]),
+                               layer=self.layer_detector + 100))
+        
+        # أدلة موجة للوصول للكواشف
+        waveguide_positions = [
+            (center[0] - 10, center[1] + 15),
+            (center[0] - 10, center[1] + 5),
+            (center[0] - 10, center[1] - 5),
+            (center[0] - 10, center[1] - 15)
+        ]
+        
+        for i, wg_pos in enumerate(waveguide_positions):
+            wg = self.waveguide.create_straight(
+                start=(wg_pos[0] - 20, wg_pos[1]),
+                end=wg_pos,
+                taper_start=0.5,
+                taper_end=1.0  # أوسع عند الكاشف
+            )
+            cell.add(wg)
+        
+        # تسمية عامة
+        cell.add(gdspy.Label("SNSPD Detectors\n(Superconducting)",
+                           (center[0] + 10, center[1]),
+                           layer=self.layer_detector + 100))
+        
+        return cell
+    
+    def _create_control_circuitry(self) -> gdspy.Cell:
+        """
+        إنشاء دارات التحكم الإلكترونية.
+        
+        تشمل: مسخنات، مراحل، ومنطق تحكم.
+        """
+        cell = gdspy.Cell("Control_Circuitry")
+        
+        # منطقة التحكم الرئيسية (في أسفل الرقاقة)
+        control_center = (250, 50)
+        
+        # مولد إشارات التحكم
+        signal_gen = gdspy.Rectangle(
+            (control_center[0] - 20, control_center[1] - 10),
+            (control_center[0] + 20, control_center[1] + 10),
+            layer=self.layer_heater
+        )
+        cell.add(signal_gen)
+        
+        cell.add(gdspy.Label("Control\nElectronics",
+                           control_center,
+                           layer=self.layer_heater + 100))
+        
+        # خطوط تحكم إلى المسخنات
+        control_lines = []
+        heater_positions = [
+            (150, 260), (170, 260),  # مسخنات المسارات
+            (350, 265), (350, 235),  # مسخنات MZI1
+            (350, 215), (350, 185)   # مسخنات MZI2
+        ]
+        
+        for i, heater_pos in enumerate(heater_positions):
+            # خط تحكم
+            line = gdspy.Rectangle(
+                (control_center[0] + i*2, control_center[1] + 15),
+                (heater_pos[0], heater_pos[1]),
+                layer=self.layer_heater
+            )
+            control_lines.append(line)
+            
+            # مقاومة التطابق
+            resistor = gdspy.Rectangle(
+                (heater_pos[0] - 2, heater_pos[1] - 0.5),
+                (heater_pos[0] + 2, heater_pos[1] + 0.5),
+                layer=self.layer_heater
+            )
+            control_lines.append(resistor)
+        
+        # تجميع خطوط التحكم
+        if control_lines:
+            cell.add(gdspy.boolean(control_lines, None, 'or'))
+        
+        return cell
+    
+    def _create_chip_border(self) -> gdspy.PolygonSet:
+        """إنشاء حدود الرقاقة وعلامات المحاذاة."""
+        border_width = 10
+        border = gdspy.Rectangle(
+            (border_width, border_width),
+            (self.chip_size[0] - border_width, self.chip_size[1] - border_width),
+            layer=0  # طبقة الحدود
+        )
+        
+        # علامات محاذاة في الزوايا
+        alignment_marks = []
+        corners = [
+            (border_width + 20, border_width + 20),
+            (self.chip_size[0] - border_width - 20, border_width + 20),
+            (border_width + 20, self.chip_size[1] - border_width - 20),
+            (self.chip_size[0] - border_width - 20, self.chip_size[1] - border_width - 20)
+        ]
+        
+        for corner in corners:
+            # علامة على شكل L
+            mark = gdspy.Polygon([
+                corner,
+                (corner[0] + 5, corner[1]),
+                (corner[0] + 5, corner[1] + 5),
+                (corner[0], corner[1] + 5)
+            ], layer=0)
+            alignment_marks.append(mark)
+        
+        # منطقة نصية للمعلومات
+        info_box = gdspy.Rectangle(
+            (self.chip_size[0] - 80, self.chip_size[1] - 30),
+            (self.chip_size[0] - 10, self.chip_size[1] - 10),
+            layer=0
+        )
+        
+        return gdspy.boolean([border, info_box] + alignment_marks, None, 'or')
+    
+    def _add_circuit_labels(self) -> List[gdspy.Label]:
+        """إضافة تسميات توضيحية للدارة الكاملة."""
+        labels = []
+        
+        # عنوان الرقاقة
+        labels.append(gdspy.Label(
+            "QUANTUM SOVEREIGN CHIP\nBell State Generator v1.0",
+            (self.chip_size[0]/2, self.chip_size[1] - 20),
+            layer=100,
+            texttype=1
+        ))
+        
+        # معلومات الأداء المتوقع
+        perf_text = (
+            f"Expected Performance:\n"
+            f"• Fidelity: {self.expected_fidelity:.3f}\n"
+            f"• Pair Rate: {self.pair_generation_rate_hz/1000:.1f} kHz\n"
+            f"• Coincidence Rate: {self.expected_coincidence_rate_hz:.0f} Hz\n"
+            f"• Wavelength: {self.wavelength} μm"
+        )
+        
+        labels.append(gdspy.Label(
+            perf_text,
+            (self.chip_size[0] - 70, 30),
+            layer=100
+        ))
+        
+        # تسميات المكونات الرئيسية
+        component_labels = [
+            ("SPDC Source", (50, 220)),
+            ("Polarization\nManagement", (150, 220)),
+            ("Entangled\nPhoton Paths", (250, 220)),
+            ("MZI Bell State\nEntangler", (350, 220)),
+            ("Quantum\nDetectors", (450, 220)),
+            ("Control\nElectronics", (250, 70))
+        ]
+        
+        for text, position in component_labels:
+            labels.append(gdspy.Label(text, position, layer=100))
+        
+        return labels
+    
+    def generate_quantum_performance_report(self) -> Dict:
+        """توليد تقرير بالأداء الكمومي المتوقع."""
+        
+        # حسابات أدق للأداء
+        quantum_efficiency = 0.85  # كفاءة كمية
+        collection_efficiency = 0.70  # كفاءة جمع
+        total_efficiency = quantum_efficiency * collection_efficiency * self.detection_efficiency
+        
+        # معدلات واقعية
+        realistic_pair_rate = self.pair_generation_rate_hz * total_efficiency
+        realistic_coincidence_rate = realistic_pair_rate * total_efficiency
+        
+        # أخطاء نظامية
+        dark_count_rate = 100  # Hz
+        accidental_coincidence_rate = realistic_pair_rate**2 * 1e-9  # تقديري
+        
+        # إخلاص متوقع مع الأخذ في الاعتبار الأخطاء
+        snr = realistic_coincidence_rate / (accidental_coincidence_rate + dark_count_rate)
+        expected_fidelity_with_noise = 0.5 + 0.5 * (snr / (snr + 1))
+        
+        report = {
+            "design_id": "Bell_State_Circuit_v1.0",
+            "chip_dimensions_um": self.chip_size,
+            "quantum_performance": {
+                "expected_fidelity": min(self.expected_fidelity, expected_fidelity_with_noise),
+                "pair_generation_rate_hz": realistic_pair_rate,
+                "coincidence_rate_hz": realistic_coincidence_rate,
+                "accidental_coincidence_rate_hz": accidental_coincidence_rate,
+                "signal_to_noise_ratio": snr,
+                "total_efficiency": total_efficiency
+            },
+            "optical_performance": {
+                "wavelength_um": self.wavelength,
+                "waveguide_loss_db_per_cm": 0.1,
+                "component_losses_db": {
+                    "spdc_source": 3.0,
+                    "polarization_splitter": 1.5,
+                    "mzi_network": 2.0,
+                    "detector_coupling": 1.0
+                },
+                "total_insertion_loss_db": 7.5
+            },
+            "electrical_performance": {
+                "heater_resistance_range_ohm": "50-200",
+                "power_per_pi_shift_mw": 25.0,
+                "thermal_time_constant_ms": 5.0,
+                "max_heater_current_ma": 20.0
+            },
+            "verification_requirements": {
+                "minimum_fidelity": 0.95,
+                "minimum_coincidence_rate_hz": 1000,
+                "maximum_dark_count_rate_hz": 1000,
+                "extinction_ratio_db": 20.0
+            },
+            "estimated_yield": 0.85
+        }
+        
+        return report
+
+# ============================================================================
+# سكريبت التوليد والاختبار
+# ============================================================================
+
+def generate_bell_state_chip():
+    """توليد وتصدير تصميم الرقاقة الكاملة."""
+    print("توليد رقاقة Bell State الكمومية المتكاملة")
+    print("=" * 60)
+    
+    # 1. إنشاء المصمم
+    print("\n1. تهيئة مصمم Bell State...")
+    bell_chip = BellStateGenerator(
+        chip_size=(500, 500),
+        wavelength=1.55,
+        material="AlGaAs"
+    )
+    
+    # 2. إنشاء الدارة الكاملة
+    print("2. إنشاء الدارة الكاملة...")
+    complete_circuit = bell_chip.create_complete_circuit()
+    
+    # 3. توليد تقرير الأداء
+    print("3. توليد تقرير الأداء المتوقع...")
+    performance_report = bell_chip.generate_quantum_performance_report()
+    
