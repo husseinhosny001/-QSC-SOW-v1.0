@@ -802,3 +802,1178 @@ print(gc.generate_design_report())
 🔄 الخطوات التالية 
 
 1. دمج مقرن المحزوز في التصميم الرئيسي للرقاقة؟
+دمج مقرن المحزوز وإنشاء مصفوفة I/O كاملة للرقاقة الكمومية
+
+🏗️ ملف التكامل الرئيسي للتصميم الكامل
+
+ملف: /03_FABRICATION/layouts/integrated_design.py
+
+```python
+"""
+التصميم المتكامل للرقاقة الكمومية مع مصفوفة I/O كاملة.
+يضم: مقرنات محزوز، دوائر كمومية، مسارات موجية، وهياكل اختبار.
+"""
+import gdspy
+import numpy as np
+from typing import List, Tuple, Dict, Optional
+import yaml
+import json
+from datetime import datetime
+import sys
+import os
+
+# إضافة مسار مكتبة المكونات
+sys.path.append('../component_library')
+from grating_coupler import AdvancedGratingCoupler, GratingDesignParameters
+from waveguide import QuantumWaveguide
+
+class QuantumChipLayout:
+    """التخطيط المتكامل للرقاقة الكمومية السيادية."""
+    
+    def __init__(self, chip_name: str = "QUANTUM_SOVEREIGN_CHIP"):
+        self.chip_name = chip_name
+        self.version = "1.0.0"
+        self.library = gdspy.GdsLibrary()
+        
+        # تحميل إعدادات PDK
+        with open('../PDK/design_rules.yaml', 'r') as f:
+            self.drc = yaml.safe_load(f)
+        
+        # تهيئة المكونات
+        self.grating_coupler = AdvancedGratingCoupler()
+        self.waveguide = QuantumWaveguide(width=0.5, layer=1)
+        
+        # تعريف طبقات التصميم
+        self.layers = {
+            'sin_core': 1,      # Si₃N₄ waveguides
+            'algas_nonlinear': 2, # AlGaAs nonlinear elements
+            'tin_heater': 10,   # TiN heaters
+            'ti_via': 11,       # Ti vias
+            'alignment': 0,     # Alignment marks
+            'text': 100,        # Text labels
+            'dicing': 200,      # Dicing streets
+            'seal_ring': 201    # Seal ring
+        }
+        
+        # أبعاد الرقاقة
+        self.chip_width = 10000  # 10 mm
+        self.chip_height = 10000 # 10 mm
+        
+        # مصفوفة I/O
+        self.io_config = {
+            'num_input_ports': 8,
+            'num_output_ports': 8,
+            'port_spacing': 250.0,  # μm بين المنافذ
+            'array_spacing': 2000.0, # μm بين مصفوفتي الدخل والخرج
+            'edge_margin': 500.0    # μm من حافة الرقاقة
+        }
+        
+        # دوائر كمية رئيسية
+        self.quantum_circuits = {
+            'bell_state_generator': {
+                'position': (4000, 5000),
+                'size': (2000, 1500),
+                'type': 'linear_optical'
+            },
+            'cnot_gate': {
+                'position': (6000, 5000),
+                'size': (1500, 1500),
+                'type': 'nonlinear_ring'
+            },
+            'quantum_memory': {
+                'position': (5000, 3000),
+                'size': (1800, 1200),
+                'type': 'resonator_array'
+            }
+        }
+        
+        # تخزين الخلايا
+        self.cells = {}
+        self.port_positions = {}
+    
+    def create_full_chip_design(self) -> gdspy.Cell:
+        """إنشاء تصميم الرقاقة الكامل المتكامل."""
+        print("=" * 70)
+        print(f"بدء تصميم الرقاقة الكمومية: {self.chip_name}")
+        print("=" * 70)
+        
+        # 1. إنشاء الخلية الرئيسية
+        main_cell = gdspy.Cell(self.chip_name)
+        
+        # 2. إضافة حلقة الختم (Seal Ring)
+        print(" 1. إضافة حلقة الختم...")
+        seal_ring = self._create_seal_ring()
+        main_cell.add(seal_ring)
+        
+        # 3. إنشاء مصفوفات I/O
+        print(" 2. إنشاء مصفوفات منافذ الدخل/خرج...")
+        input_array = self._create_input_array()
+        output_array = self._create_output_array()
+        
+        main_cell.add(input_array)
+        main_cell.add(output_array)
+        
+        # 4. إنشاء شبكة مسارات داخلية
+        print(" 3. إنشاء شبكة المسارات الداخلية...")
+        routing_network = self._create_routing_network()
+        main_cell.add(routing_network)
+        
+        # 5. إضافة الدوائر الكمومية
+        print(" 4. إضافة الدوائر الكمومية الرئيسية...")
+        quantum_circuits = self._create_quantum_circuits()
+        main_cell.add(quantum_circuits)
+        
+        # 6. إضافة هياكل الاختبار
+        print(" 5. إضافة هياكل الاختبار والتوصيف...")
+        test_structures = self._create_test_structures()
+        main_cell.add(test_structures)
+        
+        # 7. إضافة نصوص وتعريفات
+        print(" 6. إضافة النصوص والتعريفات...")
+        labels = self._create_chip_labels()
+        main_cell.add(labels)
+        
+        # 8. إضافة شوارع القطع (Dicing Streets)
+        print(" 7. إضافة شوارع القطع...")
+        dicing_streets = self._create_dicing_streets()
+        main_cell.add(dicing_streets)
+        
+        print("=" * 70)
+        print("✅ تم إكمال تصميم الرقاقة بنجاح!")
+        print("=" * 70)
+        
+        return main_cell
+    
+    def _create_seal_ring(self) -> gdspy.PolygonSet:
+        """إنشاء حلقة ختم حول الرقاقة لحمايتها."""
+        ring_width = 100.0  # عرض حلقة الختم
+        ring_offset = 50.0  # المسافة من حافة الرقاقة
+        
+        # الحلقة الخارجية
+        outer_points = [
+            (ring_offset, ring_offset),
+            (self.chip_width - ring_offset, ring_offset),
+            (self.chip_width - ring_offset, self.chip_height - ring_offset),
+            (ring_offset, self.chip_height - ring_offset)
+        ]
+        
+        # الحلقة الداخلية
+        inner_offset = ring_offset + ring_width
+        inner_points = [
+            (inner_offset, inner_offset),
+            (self.chip_width - inner_offset, inner_offset),
+            (self.chip_width - inner_offset, self.chip_height - inner_offset),
+            (inner_offset, self.chip_height - inner_offset)
+        ]
+        
+        # إنشاء حلقة الختم (فرق بين المضلعين)
+        seal_ring = gdspy.boolean(
+            gdspy.Polygon(outer_points),
+            gdspy.Polygon(inner_points),
+            'not',
+            layer=self.layers['seal_ring']
+        )
+        
+        return seal_ring
+    
+    def _create_input_array(self) -> gdspy.Cell:
+        """إنشاء مصفوفة منافذ الدخل."""
+        cell = gdspy.Cell("INPUT_PORTS_ARRAY")
+        
+        num_ports = self.io_config['num_input_ports']
+        spacing = self.io_config['port_spacing']
+        margin = self.io_config['edge_margin']
+        
+        # الموضع الأولي (الجهة اليسرى من الرقاقة)
+        start_x = margin
+        start_y = self.chip_height / 2 - ((num_ports - 1) * spacing) / 2
+        
+        # إنشاء كل مقرن دخل
+        for i in range(num_ports):
+            port_pos = (start_x, start_y + i * spacing)
+            
+            # حفظ موقع المنفذ للتوجيه الداخلي
+            self.port_positions[f'IN_{i+1}'] = {
+                'position': port_pos,
+                'type': 'input',
+                'orientation': 'right'  # الضوء يدخل باتجاه اليمين
+            }
+            
+            # إنشاء مقرن المحزوز الفردي
+            gc_cell = self.grating_coupler.create_grating_structure(
+                port_pos, "input"
+            )
+            
+            # إنشاء مسار داخلي من المنفذ
+            internal_route = self._create_internal_waveguide(
+                port_pos, 
+                direction='right',
+                length=500.0
+            )
+            
+            cell.add(gc_cell)
+            cell.add(internal_route)
+            
+            # إضافة تسمية المنفذ
+            port_label = gdspy.Text(
+                f"IN{i+1}",
+                20,
+                (port_pos[0] - 50, port_pos[1]),
+                layer=self.layers['text']
+            )
+            cell.add(port_label)
+            
+            # إضافة علامة ترتيب
+            order_mark = gdspy.Rectangle(
+                (port_pos[0] - 10, port_pos[1] - 3),
+                (port_pos[0] - 5, port_pos[1] + 3),
+                layer=self.layers['alignment']
+            )
+            cell.add(order_mark)
+        
+        # إضافة إطار حول المصفوفة
+        array_width = 200
+        array_height = (num_ports - 1) * spacing + 200
+        array_frame = gdspy.Rectangle(
+            (start_x - 100, start_y - 100),
+            (start_x + array_width, start_y + array_height - 100),
+            layer=self.layers['alignment']
+        )
+        cell.add(array_frame)
+        
+        return cell
+    
+    def _create_output_array(self) -> gdspy.Cell:
+        """إنشاء مصفوفة منافذ الخرج."""
+        cell = gdspy.Cell("OUTPUT_PORTS_ARRAY")
+        
+        num_ports = self.io_config['num_output_ports']
+        spacing = self.io_config['port_spacing']
+        margin = self.io_config['edge_margin']
+        
+        # الموضع الأولي (الجهة اليمنى من الرقاقة)
+        start_x = self.chip_width - margin
+        start_y = self.chip_height / 2 - ((num_ports - 1) * spacing) / 2
+        
+        # إنشاء كل مقرن خرج
+        for i in range(num_ports):
+            port_pos = (start_x, start_y + i * spacing)
+            
+            # حفظ موقع المنفذ
+            self.port_positions[f'OUT_{i+1}'] = {
+                'position': port_pos,
+                'type': 'output',
+                'orientation': 'left'  # الضوء يخرج باتجاه اليسار
+            }
+            
+            # إنشاء مقرن المحزوز الفردي
+            gc_cell = self.grating_coupler.create_grating_structure(
+                port_pos, "output"
+            )
+            
+            # إنشاء مسار داخلي إلى المنفذ
+            internal_route = self._create_internal_waveguide(
+                port_pos, 
+                direction='left',
+                length=500.0
+            )
+            
+            cell.add(gc_cell)
+            cell.add(internal_route)
+            
+            # إضافة تسمية المنفذ
+            port_label = gdspy.Text(
+                f"OUT{i+1}",
+                20,
+                (port_pos[0] + 50, port_pos[1]),
+                layer=self.layers['text']
+            )
+            cell.add(port_label)
+            
+            # إضافة علامة ترتيب
+            order_mark = gdspy.Rectangle(
+                (port_pos[0] + 5, port_pos[1] - 3),
+                (port_pos[0] + 10, port_pos[1] + 3),
+                layer=self.layers['alignment']
+            )
+            cell.add(order_mark)
+        
+        return cell
+    
+    def _create_internal_waveguide(self, start_pos: Tuple[float, float],
+                                  direction: str, length: float) -> gdspy.Cell:
+        """إنشاء مسار موجه داخلي من/إلى المنفذ."""
+        cell = gdspy.Cell(f"Waveguide_Internal")
+        
+        # تحديد نقطة النهاية بناءً على الاتجاه
+        if direction == 'right':
+            end_pos = (start_pos[0] + length, start_pos[1])
+        elif direction == 'left':
+            end_pos = (start_pos[0] - length, start_pos[1])
+        else:
+            end_pos = (start_pos[0], start_pos[1] + length)
+        
+        # إنشاء مسار مستقيم أولي
+        waveguide = self.waveguide.create_straight(start_pos, end_pos)
+        cell.add(waveguide)
+        
+        # إضافة منعطفات إذا لزم الأمر لتجنب التداخل
+        if abs(end_pos[1] - start_pos[1]) < 100:
+            # مسار بسيط مستقيم
+            pass
+        else:
+            # مسار مع منعطفات
+            cell = self._create_routed_waveguide(start_pos, end_pos)
+        
+        return cell
+    
+    def _create_routed_waveguide(self, start: Tuple[float, float],
+                                end: Tuple[float, float]) -> gdspy.Cell:
+        """إنشاء مسار موجه مع منعطفات للوصول إلى الدوائر الداخلية."""
+        cell = gdspy.Cell(f"Routed_WG_{start[0]:.0f}_{start[1]:.0f}")
+        
+        x1, y1 = start
+        x2, y2 = end
+        
+        # تصميم مسار على شكل "مانهاتن" (Manhattan routing)
+        bend_radius = 50.0  # نصف قطر الانحناء
+        
+        # نقطة وسيطة أفقية
+        mid_x = (x1 + x2) / 2
+        
+        # المسار: بداية → منعطف → جزء رأسي → منعطف → نهاية
+        points = [
+            (x1, y1),  # بداية
+            (x1 + bend_radius, y1),  # بداية المنعطف
+            (x1 + bend_radius, y2),  # نهاية الجزء الرأسي
+            (x2 - bend_radius, y2),  # قبل المنعطف الأخير
+            (x2, y2)  # نهاية
+        ]
+        
+        # إنشاء المسار باستخدام FlexPath
+        path = gdspy.FlexPath(
+            points,
+            width=0.5,
+            corners="circular",
+            bend_radius=bend_radius,
+            layer=self.layers['sin_core'],
+            gdsii_path=True
+        )
+        
+        cell.add(path)
+        
+        return cell
+    
+    def _create_routing_network(self) -> gdspy.Cell:
+        """إنشاء شبكة توجيه كاملة تربط المنافذ بالدوائر."""
+        cell = gdspy.Cell("ROUTING_NETWORK")
+        
+        print("    • إنشاء مسارات من المداخل إلى دوائر Bell State...")
+        # توجيه المداخل 1-4 إلى دائرة توليد Bell State
+        bell_circuit_pos = self.quantum_circuits['bell_state_generator']['position']
+        
+        for i in range(4):
+            if f'IN_{i+1}' in self.port_positions:
+                port_info = self.port_positions[f'IN_{i+1}']
+                start_pos = (port_info['position'][0] + 500, port_info['position'][1])
+                
+                # النهاية عند الدائرة الكمومية
+                end_pos = (
+                    bell_circuit_pos[0] - 200,
+                    bell_circuit_pos[1] - 300 + i * 150
+                )
+                
+                route = self._create_smart_route(start_pos, end_pos, f"Route_IN{i+1}_Bell")
+                cell.add(route)
+        
+        print("    • إنشاء مسارات من Bell State إلى بوابة CNOT...")
+        # توجيه من Bell State إلى CNOT
+        cnot_pos = self.quantum_circuits['cnot_gate']['position']
+        
+        for i in range(2):  # قناتان متشابكتان
+            start_pos = (
+                bell_circuit_pos[0] + 1000,
+                bell_circuit_pos[1] - 200 + i * 400
+            )
+            end_pos = (
+                cnot_pos[0] - 200,
+                cnot_pos[1] - 100 + i * 200
+            )
+            
+            route = self._create_smart_route(start_pos, end_pos, f"Route_Bell_CNOT_{i+1}")
+            cell.add(route)
+        
+        print("    • إنشاء مسارات من CNOT إلى المخارج...")
+        # توجيه من CNOT إلى المخارج
+        for i in range(4):
+            if f'OUT_{i+1}' in self.port_positions:
+                port_info = self.port_positions[f'OUT_{i+1}']
+                end_pos = (port_info['position'][0] - 500, port_info['position'][1])
+ الكمومية
+                start_pos = (
+                    cnot_pos[0] + 800,
+                    cnot_pos[1] - 300 + i * 200
+                )
+                
+                route = self._create_smart_route(start_pos, end_pos, f"Route_CNOT_OUT{i+1}")
+                cell.add(route)
+        
+        return cell
+    
+    def _create_smart_route(self, start: Tuple[float, float], 
+                           end: Tuple[float, float],
+                           route_name: str) -> gdspy.Cell:
+        """إنشاء مسار ذكي مع تجنب العوائق."""
+        cell = gdspy.Cell(route_name)
+        
+        x1, y1 = start
+        x2, y2 = end
+        
+        # تحديد إذا كان المسار يتطلب منعطفات كثيرة
+        horizontal_distance = abs(x2 - x1)
+        vertical_distance = abs(y2 - y1)
+        
+        # إذا كانت المسافة الأفقية كبيرة، استخدم مسارًا مع منعطفات
+        if horizontal_distance > 1000:
+            # مسار بمنعطفين (بديل)
+            mid_y = (y1 + y2) / 2
+            
+            points = [
+                (x1, y1),
+                (x1 + 200, y1),      # جزء أفقي
+                (x1 + 200, mid_y),   # جزء رأسي
+                (x2 - 200, mid_y),   # جزء أفقي
+                (x2 - 200, y2),      # جزء رأسي
+                (x2, y2)             # نهاية
+            ]
+        else:
+            # مسار مباشر أكثر
+            points = [start, end]
+        
+        # إنشاء المسار
+        path = gdspy.FlexPath(
+            points,
+            width=0.5,
+            corners="circular",
+            bend_radius=25.0,
+            layer=self.layers['sin_core'],
+            gdsii_path=True
+        )
+        
+        cell.add(path)
+        
+        # إضافة مقسم شعاع إذا كان المسار يتفرع
+        if 'Bell' in route_name and 'IN' in route_name:
+            splitter = self._create_beam_splitter(
+                (points[2][0] - 50, points[2][1]),
+                coupling=0.5
+            )
+            cell.add(splitter)
+        
+        return cell
+    
+    def _create_beam_splitter(self, position: Tuple[float, float],
+                             coupling: float = 0.5) -> gdspy.PolygonSet:
+        """إنشاء مقسم شعاع بسيط."""
+        # تصميم مبسط لمقسم شعاع
+        length = 20.0
+        width = 0.5
+        gap = 0.15
+        
+        x, y = position
+        
+        # دليلين موجيين متوازيين مع اقتران
+        wg1 = gdspy.Rectangle(
+            (x, y - gap/2 - width),
+            (x + length, y - gap/2),
+            layer=self.layers['sin_core']
+        )
+        
+        wg2 = gdspy.Rectangle(
+            (x, y + gap/2),
+            (x + length, y + gap/2 + width),
+            layer=self.layers['sin_core']
+        )
+        
+        # منطقة الاقتران
+        coupling_region = gdspy.Rectangle(
+            (x + length/2 - 2, y - gap/2 - width),
+            (x + length/2 + 2, y + gap/2 + width),
+            layer=self.layers['sin_core']
+        )
+        
+        return wg1, wg2, coupling_region
+    
+    def _create_quantum_circuits(self) -> gdspy.Cell:
+        """إنشاء الدوائر الكمومية الرئيسية."""
+        cell = gdspy.Cell("QUANTUM_CIRCUITS")
+        
+        # 1. دائرة توليد حالة Bell
+        bell_circuit = self._create_bell_state_circuit(
+            self.quantum_circuits['bell_state_generator']['position']
+        )
+        cell.add(bell_circuit)
+        
+        # 2. بوابة CNOT غير خطية
+        cnot_circuit = self._create_cnot_gate(
+            self.quantum_circuits['cnot_gate']['position']
+        )
+        cell.add(cnot_circuit)
+        
+        # 3. ذاكرة كمومية (مصفوفة رنانات)
+        memory_circuit = self._create_quantum_memory(
+            self.quantum_circuits['quantum_memory']['position']
+        )
+        cell.add(memory_circuit)
+        
+        return cell
+    
+    def _create_bell_state_circuit(self, position: Tuple[float, float]) -> gdspy.Cell:
+        """إنشاء دائرة توليد حالة Bell متشابكة."""
+        cell = gdspy.Cell("BELL_STATE_GENERATOR")
+        
+        x, y = position
+        
+        # إطار الدائرة
+        frame = gdspy.Rectangle(
+            (x - 1000, y - 750),
+            (x + 1000, y + 750),
+            layer=self.layers['alignment']
+        )
+        cell.add(frame)
+        
+        # عنوان الدائرة
+        title = gdspy.Text(
+            "BELL STATE GENERATOR",
+            30,
+            (x, y + 800),
+            layer=self.layers['text']
+        )
+        cell.add(title)
+        
+        # مكونات الدائرة البصرية
+        # 1. مقسم شعاع 50:50 مركزي
+        bs = gdspy.Rectangle(
+            (x - 10, y - 100),
+            (x + 10, y + 100),
+            layer=self.layers['sin_core']
+        )
+        cell.add(bs)
+        
+        bs_label = gdspy.Text("BS 50:50", 15, (x, y + 120), layer=self.layers['text'])
+        cell.add(bs_label)
+        
+        # 2. مسخني طور قابلين للضبط
+        for i, y_offset in enumerate([-200, 200]):
+            phase_shifter = gdspy.Rectangle(
+                (x + 200, y + y_offset - 25),
+                (x + 400, y + y_offset + 25),
+                layer=self.layers['tin_heater']
+            )
+            cell.add(phase_shifter)
+            
+            # نقاط اتصال كهربائية
+            for x_contact in [x + 180, x + 420]:
+                contact = gdspy.Rectangle(
+                    (x_contact, y + y_offset - 15),
+                    (x_contact + 20, y + y_offset + 15),
+                    layer=self.layers['ti_via']
+                )
+                cell.add(contact)
+            
+            ps_label = gdspy.Text(f"PS{i+1}", 12, (x + 300, y + y_offset + 50), 
+                                 layer=self.layers['text'])
+            cell.add(ps_label)
+        
+        # 3. مسارات داخلية
+        # المسارات من المداخل إلى مقسم الشعاع
+for y_in in [-300, -100, 100, 300]:
+            waveguide = gdspy.FlexPath(
+                [(x - 500, y + y_in), (x - 10, y + y_in/3)],
+                width=0.5,
+                layer=self.layers['sin_core']
+            )
+            cell.add(waveguide)
+        
+        # المسارات من مقسم الشعاع إلى مسخني الطور
+        for y_out in [-200, 200]:
+            waveguide = gdspy.FlexPath(
+                [(x + 10, y_out/3), (x + 200, y + y_out)],
+                width=0.5,
+                layer=self.layers['sin_core']
+            )
+            cell.add(waveguide)
+        
+        # 4. منطقة التداخل
+        interference_zone = gdspy.Rectangle(
+            (x + 450, y - 300),
+            (x + 650, y + 300),
+            layer=self.layers['sin_core']
+        )
+        cell.add(interference_zone)
+        
+        zone_label = gdspy.Text("Interference", 15, (x + 550, y - 350), 
+                               layer=self.layers['text'])
+        cell.add(zone_label)
+        
+        # 5. مخارج الدائرة
+        for i, y_out in enumerate([-250, -150, 150, 250]):
+            waveguide = gdspy.FlexPath(
+                [(x + 650, y + y_out), (x + 800, y + y_out)],
+                width=0.5,
+                layer=self.layers['sin_core']
+            )
+            cell.add(waveguide)
+            
+            out_label = gdspy.Text(f"Out{i+1}", 12, (x + 850, y + y_out), 
+                                  layer=self.layers['text'])
+            cell.add(out_label)
+        
+        return cell
+    
+    def _create_cnot_gate(self, position: Tuple[float, float]) -> gdspy.Cell:
+        """إنشاء بوابة CNOT باستخدام حلقات رنانة غير خطية."""
+        cell = gdspy.Cell("CNOT_QUANTUM_GATE")
+        
+        x, y = position
+        
+        # إطار الدائرة
+        frame = gdspy.Rectangle(
+            (x - 750, y - 750),
+            (x + 750, y + 750),
+            layer=self.layers['alignment']
+        )
+        cell.add(frame)
+        
+        # عنوان الدائرة
+        title = gdspy.Text(
+            "CNOT QUANTUM GATE",
+            30,
+            (x, y + 800),
+            layer=self.layers['text']
+        )
+        cell.add(title)
+        
+        # 1. حلقات رنانة غير خطية (AlGaAs)
+        for i, y_ring in enumerate([-200, 200]):
+            # الحلقة الرنانة
+            ring_radius = 50.0
+            ring = gdspy.Round(
+                (x, y + y_ring),
+                ring_radius,
+                inner_radius=ring_radius - 0.5,
+                layer=self.layers['algas_nonlinear']
+            )
+            cell.add(ring)
+            
+            # دليل الحافلة (Bus Waveguide)
+            bus_y = y + y_ring + ring_radius + 0.2
+            bus = gdspy.Rectangle(
+                (x - ring_radius - 20, bus_y - 0.25),
+                (x + ring_radius + 20, bus_y + 0.25),
+                layer=self.layers['sin_core']
+            )
+            cell.add(bus)
+            
+            ring_label = gdspy.Text(f"Kerr Ring {i+1}", 15, (x, y + y_ring - 80), 
+                                   layer=self.layers['text'])
+            cell.add(ring_label)
+        
+        # 2. مسخنات للتحكم في الحلقات
+        for i, y_heater in enumerate([-200, 200]):
+            heater = gdspy.Rectangle(
+                (x - 40, y + y_heater - 80),
+                (x + 40, y + y_heater - 60),
+                layer=self.layers['tin_heater']
+            )
+            cell.add(heater)
+            
+            # اتصالات كهربائية
+            for x_contact in [x - 50, x + 30]:
+                contact = gdspy.Rectangle(
+                    (x_contact, y + y_heater - 85),
+                    (x_contact + 20, y + y_heater - 55),
+                    layer=self.layers['ti_via']
+                )
+                cell.add(contact)
+        
+        # 3. مداخل البوابة
+        input_labels = ["Control", "Target"]
+        for i, y_in in enumerate([-200, 200]):
+            waveguide = gdspy.FlexPath(
+                [(x - 600, y + y_in), (x - 70, y + y_in)],
+                width=0.5,
+                layer=self.layers['sin_core']
+            )
+            cell.add(waveguide)
+            
+            in_label = gdspy.Text(f"{input_labels[i]} In", 15, 
+                                 (x - 650, y + y_in), layer=self.layers['text'])
+            cell.add(in_label)
+        
+        # 4. مخارج البوابة
+        for i, y_out in enumerate([-200, 200]):
+            waveguide = gdspy.FlexPath(
+                [(x + 70, y + y_out), (x + 600, y + y_out)],
+                width=0.5,
+                layer=self.layers['sin_core']
+            )
+            cell.add(waveguide)
+            
+            out_label = gdspy.Text(f"Out{i+1}", 15, (x + 650, y + y_out), 
+                                  layer=self.layers['text'])
+        cell.add(out_label)
+        
+        # 5. منطقة التحكم الإلكتروني
+        control_zone = gdspy.Rectangle(
+            (x - 100, y - 300),
+            (x + 100, y - 200),
+            layer=self.layers['tin_heater']
+        )
+        cell.add(control_zone)
+        
+        ctrl_label = gdspy.Text("Control Electronics", 12, (x, y - 350), 
+                               layer=self.layers['text'])
+        cell.add(ctrl_label)
+        
+        return cell
+    
+    def _create_quantum_memory(self, position: Tuple[float, float]) -> gdspy.Cell:
+        """إنشاء ذاكرة كمومية (مصفوفة رنانات)."""
+        cell = gdspy.Cell("QUANTUM_MEMORY")
+        
+        x, y = position
+        
+        # إطار الدائرة
+        frame = gdspy.Rectangle(
+            (x - 900, y - 600),
+            (x + 900, y + 600),
+            layer=self.layers['alignment']
+        )
+        cell.add(frame)
+        
+        # عنوان الدائرة
+        title = gdspy.Text(
+            "QUANTUM MEMORY (Resonator Array)",
+            25,
+            (x, y + 650),
+            layer=self.layers['text']
+        )
+        cell.add(title)
+        
+        # مصفوفة من الحلقات الرنانة
+        num_rows = 4
+        num_cols = 4
+        ring_spacing = 200
+        
+        for row in range(num_rows):
+            for col in range(num_cols):
+                ring_x = x - (num_cols-1) * ring_spacing / 2 + col * ring_spacing
+                ring_y = y - (num_rows-1) * ring_spacing / 2 + row * ring_spacing
+                
+                # حلقة رنانة صغيرة
+                ring = gdspy.Round(
+                    (ring_x, ring_y),
+                    20.0,
+                    inner_radius=19.5,
+                    layer=self.layers['sin_core']
+                )
+                cell.add(ring)
+                
+                # دليل اقتران
+                coupler = gdspy.Rectangle(
+                    (ring_x - 30, ring_y + 25),
+                    (ring_x + 30, ring_y + 27),
+                    layer=self.layers['sin_core']
+                )
+                cell.add(coupler)
+                
+                # مسخن تحكم فردي
+                heater = gdspy.Rectangle(
+                    (ring_x - 15, ring_y - 40),
+                    (ring_x + 15, ring_y - 35),
+                    layer=self.layers['tin_heater']
+                )
+                cell.add(heater)
+        
+        # دليل موجه رئيسي للتغذية
+        main_bus = gdspy.FlexPath(
+            [(x - 950, y), (x + 950, y)],
+            width=0.5,
+            layer=self.layers['sin_core']
+        )
+        cell.add(main_bus)
+        
+        bus_label = gdspy.Text("Main Bus Waveguide", 15, (x, y - 100), 
+                              layer=self.layers['text'])
+        cell.add(bus_label)
+        
+        return cell
+    
+    def _create_test_structures(self) -> gdspy.Cell:
+        """إنشاء هياكل اختبار وتوصيف."""
+        cell = gdspy.Cell("TEST_STRUCTURES")
+        
+        # وضع هياكل الاختبار في الزوايا
+        corners = [
+            (500, 500),           # الزاوية اليسرى السفلى
+            (self.chip_width - 500, 500),  # الزاوية اليمنى السفلى
+            (500, self.chip_height - 500), # الزاوية اليسرى العليا
+            (self.chip_width - 500, self.chip_height - 500) # الزاوية اليمنى العليا
+        ]
+        
+        for i, corner in enumerate(corners):
+            test_cell = self._create_test_structure_set(corner, f"TestSet_{i+1}")
+            cell.add(test_cell)
+        
+        return cell
+    
+    def _create_test_structure_set(self, position: Tuple[float, float], 
+                                  set_name: str) -> gdspy.Cell:
+        """إنشاء مجموعة هياكل اختبار في موقع معين."""
+        cell = gdspy.Cell(set_name)
+        
+        x, y = position
+        
+        # 1. هياكل قياس الخسائر
+        for i, length in enumerate([1000, 5000, 10000]):
+            wg = gdspy.Rectangle(
+                (x, y + i * 150),
+                (x + length, y + i * 150 + 0.5),
+                layer=self.layers['sin_core']
+            )
+            cell.add(wg)
+            
+            length_label = gdspy.Text(f"L={length}μm", 10, 
+                                     (x + length/2, y + i * 150 - 20),
+                                     layer=self.layers['text'])
+            cell.add(length_label)
+        
+        # 2. مقسمات أشعة بمعاملات اقتران مختلفة
+        x_offset = x + 200
+        for i, coupling in enumerate([0.1, 0.3, 0.5, 0.7, 0.9]):
+            # تصميم مبسط لمقسم شعاع
+            coupler = gdspy.Rectangle(
+                (x_offset + i * 100, y),
+                (x_offset + i * 100 + 20, y + 50),
+                layer=self.layers['sin_core']
+            )
+            cell.add(coupler)
+            
+            coupling_label = gdspy.Text(f"κ={coupling}", 8,
+                                       (x_offset + i * 100 + 10, y - 15),
+                                       layer=self.layers['text'])
+            cell.add(coupling_label)
+        
+        # 3. حلقات رنانة بأحجام مختلفة
+        x_rings = x + 800
+        for i, radius in enumerate([20, 40, 60, 80]):
+            ring = gdspy.Round(
+                (x_rings + i * 120, y + 100),
+                radius,
+                inner_radius=radius - 0.5,
+                layer=self.layers['sin_core']
+            )
+            cell.add(ring)
+            
+            radius_label = gdspy.Text(f"R={radius}", 8,
+                                     (x_rings + i * 120, y + 100 + radius + 20),
+                                     layer=self.layers['text'])
+            cell.add(radius_label)
+        
+        # 4. هياكل محاذاة بصرية
+        alignment = self._create_alignment_pattern((x + 400, y + 300))
+        cell.add(alignment)
+        
+        # 5. هياكل قياس كهربائية
+        for i in range(4):
+            resistor = gdspy.Rectangle(
+                (x + 50 + i * 80, y + 400),
+                (x + 100 + i * 80, y + 410),
+                layer=self.layers['tin_heater']
+            )
+            cell.add(resistor)
+            
+            # نقاط اتصال
+            for j in range(2):
+                contact = gdspy.Rectangle(
+                    (x + 50 + i * 80 + j * 40, y + 395),
+                    (x + 70 + i * 80 + j * 40, y + 415),
+                    layer=self.layers['ti_via']
+                )
+                cell.add(contact)
+        
+        return cell
+    
+    def _create_alignment_pattern(self, position: Tuple[float, float]) -> gdspy.Cell:
+        """إنشاء نمط محاذاة بصرية."""
+        cell = gdspy.Cell("Alignment_Pattern")
+        
+        x, y = position
+        
+        # صليب مركزي
+        cross_size = 50
+        # خط أفقي
+        h_line = gdspy.Rectangle(
+            (x - cross_size/2, y - 1),
+            (x + cross_size/2, y + 1),
+            layer=self.layers['alignment']
+        )
+        # خط رأسي
+        v_line = gdspy.Rectangle(
+            (x - 1, y - cross_size/2),
+            (x + 1, y + cross_size/2),
+            layer=self.layers['alignment']
+        )
+        
+        # دوائر متحدة المركز
+        for radius in [10, 20, 30, 40]:
+            circle = gdspy.Round(
+                (x, y),
+                radius,
+                layer=self.layers['alignment']
+            )
+            cell.add(circle)
+        
+        cell.add(h_line)
+        cell.add(v_line)
+        
+        return cell
+    
+    def _create_chip_labels(self) -> gdspy.Cell:
+        """إنشاء جميع النصوص والتعريفات على الرقاقة."""
+        cell = gdspy.Cell("CHIP_LABELS")
+        
+        # العنوان الرئيسي
+        main_title = gdspy.Text(
+            f"{self.chip_name} v{self.version}",
+            100,
+            (self.chip_width/2, self.chip_height - 200),
+            layer=self.layers['text']
+        )
+        cell.add(main_title)
+        
+        # وصف الرقاقة
+        description = gdspy.Text(
+            "QUANTUM PHOTONIC SOVEREIGN CHIP",
+            50,
+            (self.chip_width/2, self.chip_height - 300),
+            layer=self.layers['text']
+        )
+        cell.add(description)
+        
+        # معلومات التصميم
+        info_lines = [
+            "Hybrid Si₃N₄/AlGaAs Quantum Photonic Circuit",
+            f"Design Date: {datetime.now().strftime('%Y-%m-%d')}",
+            "Features: Bell State Generation, CNOT Gate, Quantum Memory",
+            "I/O: 8 Input Ports, 8 Output Ports @ 1550nm",
+            "Technology: 220nm Si₃N₄ + 300nm AlGaAs"
+        ]
+        
+        for i, line in enumerate(info_lines):
+            text = gdspy.Text(
+                line,
+                25,
+                (self.chip_width/2, self.chip_height - 450 - i * 40),
+                layer=self.layers['text']
+            )
+            cell.add(text)
+        
+        # تسمية المناطق
+        regions = [
+            ("INPUT PORTS", (500, self.chip_height/2)),
+            ("BELL STATE GENERATOR", (4000, 6500)),
+            ("CNOT QUANTUM GATE", (6000, 6500)),
+            ("QUANTUM MEMORY", (5000, 3500)),
+            ("OUTPUT PORTS", (9500, self.chip_height/2)),
+            ("TEST STRUCTURES", "corners")
+        ]
+        
+        for label, pos in regions:
+            if pos == "corners":
+                # وضع في الزوايا
+                corners = [
+                    (1000, 1000),
+                    (self.chip_width - 1000, 1000),
+                    (1000, self.chip_height - 1000),
+                    (self.chip_width - 1000, self.chip_height - 1000)
+                ]
+                for corner in corners:
+                    region_text = gdspy.Text(
+                        "TEST",
+                        30,
+                        corner,
+                        layer=self.layers['text']
+                    )
+                    cell.add(region_text)
+            else:
+                region_text = gdspy.Text(
+                    label,
+                    35,
+                    pos,
+                    layer=self.layers['text']
+                )
+                cell.add(region_text)
+        
+        # معلومات إضافية في الأسفل
+        footer_info = [
+            "Confidential - Quantum Sovereign Project",
+            f"Chip ID: QSC-{datetime.now().strftime('%Y%m%d')}-001",
+            "Layer 1: Si₃N₄ (Waveguides) | Layer 2: AlGaAs (Nonlinear)",
+            "Layer 10: TiN (Heaters) | Layer 11: Ti (Vias)"
+        ]
+        
+        for i, line in enumerate(footer_info):
+            text = gdspy.Text(
+                line,
+                20,
+                (self.chip_width/2, 300 + i * 30),
+                layer=self.layers['text']
+            )
+            cell.add(text)
+        
+        return cell
+    
+    def _create_dicing_streets(self) -> gdspy.Cell:
+        """إنشاء شوارع القطع حول الرقاقة."""
+        cell = gdspy.Cell("DICING_STREETS")
+        
+        street_width = 100.0  # عرض شارع القطع
+        
+        # الشوارع الأفقية (أعلى وأسفل)
+        horizontal_streets = [
+            gdspy.Rectangle(
+                (0, 0),
+                (self.chip_width, street_width),
+                layer=self.layers['dicing']
+            ),
+            gdspy.Rectangle(
+                (0, self.chip_height - street_width),
+                (self.chip_width, self.chip_height),
+                layer=self.layers['dicing']
+            )
+        ]
+        
+        # الشوارع الرأسية (يمين ويسار)
+        vertical_streets = [
+            gdspy.Rectangle(
+                (0, 0),
+                (street_width, self.chip_height),
+                layer=self.layers['dicing']
+            ),
+            gdspy.Rectangle(
+                (self.chip_width - street_width, 0),
+                (self.chip_width, self.chip_height),
+                layer=self.layers['dicing']
+            )
+        ]
+        
+        # خطوط القطع الداخلية (للتوجيه)
+        for i in range(1, 4):
+            # خطوط أفقية
+            h_line = gdspy.Rectangle(
+                (0, i * self.chip_height/4 - 5),
+                (self.chip_width, i * self.chip_height/4 + 5),
+                layer=self.layers['dicing']
+            )
+            
+            # خطوط رأسية
+            v_line = gdspy.Rectangle(
+                (i * self.chip_width/4 - 5, 0),
+                (i * self.chip_width/4 + 5, self.chip_height),
+                layer=self.layers['dicing']
+            )
+            
+            cell.add(h_line)
+            cell.add(v_line)
+        
+        cell.add(horizontal_streets)
+        cell.add(vertical_streets)
+        
+        # إضافة علامات القطع
+        cut_marks = self._create_cut_marks()
+        cell.add(cut_marks)
+        
+        return cell
+    
+    def _create_cut_marks(self) -> gdspy.Cell:
+        """إنشاء علامات القطع في الزوايا."""
+        cell = gdspy.Cell("CUT_MARKS")
+        
+        mark_size = 20
+        mark_offset = 150  # من حافة شارع القطع
+        
+        # الزوايا الأربع
+        corners = [
+            (mark_offset, mark_offset),  # يسار-أسفل
+            (self.chip_width - mark_offset, mark_offset),  # يمين-أسفل
+            (mark_offset, self.chip_height - mark_offset),  # يسار-أعلى
+            (self.chip_width - mark_offset, self.chip_height - mark_offset)  # يمين-أعلى
+        ]
+        
+        for corner_x, corner_y in corners:
+            # علامة على شكل L
+            mark = gdspy.Polygon([
+                (corner_x - mark_size/2, corner_y),
+                (corner_x, corner_y),
+                (corner_x, corner_y - mark_size/2),
+                (corner_x + mark_size/2, corner_y - mark_size/2),
+                (corner_x + mark_size/2, corner_y),
+                (corner_x, corner_y),
+                (corner_x, corner_y + mark_size/2),
+                (corner_x - mark_size/2, corner_y + mark_size/2)
+            ], layer=self.layers['dicing'])
+            
+            cell.add(mark)
+        
+        return cell
+    
+    def export_design(self, output_dir: str = "../layouts/gds") -> Dict:
+        """تصدير التصميم الكامل إلى ملف GDS."""
+        import os
+        
+        # إنشاء مجلد الإخراج إذا لم يكن موجوداً
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # إنشاء التصميم الكامل
+        print("\n" + "=" * 70)
+        print("تصدير التصميم الكامل للرقاقة...")
+        print("=" * 70)
+        
+        main_cell = self.create_full_chip_design()
+        
+        # إضافة الخلية الرئيسية للمكتبة
+        self.library.add(main_cell)
+        
+        # اسم الملف النهائي
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"{self.chip_name}_{timestamp}.gds"
+        filepath = os.path.join(output_dir, filename)
+        
+        # حفظ الملف GDS
+        self.library.write_gds(filepath)
+        
+        # إنشاء تقرير التصميم
+        report = self._generate_design_report(filepath)
+        
+        print(f"\n✅ تم تصدير التصميم بنجاح!")
+        print(f"📁 الملف: {filepath}")
+        print(f"📄 التقرير: {filepath.replace('.gds', '_report.txt')}")
+        
+        return {
+            'filepath': filepath,
+            'chip_name': self.chip_name,
+            'version': self.version,
+            'timestamp': timestamp,
+            'report': report
+        }
+    
+    def _generate_design_report(self, gds_filepath: str) -> str:
+        """توليد تقرير مفصل عن التصميم."""
+        import os
+        
+        report = f"""
+        ================================================================================
+        تقرير تصميم الرقاقة الكمومية السيادية
+        ========================================
