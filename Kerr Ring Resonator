@@ -1,0 +1,643 @@
+تصميم الحلقة الرنانة غير الخطية
+Kerr Ring Resonator
+
+ملف: /03_FABRICATION/component_library/ring_resonator.py
+
+```python
+"""
+الحلقة الرنانة غير الخطية للرقاقة الكمومية السيادية.
+مصممة لتأثير Kerr لبوابات CNOT الضوئية.
+"""
+import numpy as np
+import gdspy
+import yaml
+import json
+from typing import Tuple, List, Dict, Optional
+from dataclasses import dataclass
+import warnings
+
+@dataclass
+class RingParameters:
+    """معلمات الحلقة الرنانة المتقدمة."""
+    radius: float  # نصف القطر بالميكرون
+    width: float   # عرض الدليل الموجي
+    gap: float     # فجوة الاقتران مع دليل الحافلة
+    material: str  # 'Si3N4' أو 'AlGaAs'
+    layer: Tuple[int, int]  # (رقم الطبقة، نوع البيانات)
+    
+    # معلمات غير خطية
+    nonlinear_index: float = 2.4e-19  # n₂ للمادة (m²/W)
+    q_factor_target: float = 1e5      # معامل الجودة المستهدف
+    
+    # معلمات الاقتران
+    coupling_length: float = 5.0      # طول منطقة الاقتران
+    coupling_coefficient: float = 0.1 # معامل الاقتران (κ)
+
+class NonlinearRingResonator:
+    """
+    حلقة رنانة غير خطية متقدمة مع تأثير Kerr.
+    
+    المميزات:
+    1. تصميم مضبوط للرنين عند 1550nm
+    2. نموذج اقتران مع دليلين حافلة (إدخال/إخراج)
+    3. إمكانية ضبط الطور حراريًا
+    4. هياكل اختبار مدمجة
+    """
+    
+    def __init__(self, params: RingParameters):
+        self.params = params
+        self.load_drc_rules()
+        self.validate_parameters()
+        
+        # ثوابت فيزيائية
+        self.wavelength = 1.55  # μm
+        self.c = 299792458      # m/s
+        self.epsilon0 = 8.854e-12
+        
+        # إعداد مكتبة gdspy
+        self.cell = gdspy.Cell(f"Ring_R{params.radius}_G{params.gap}")
+        
+    def load_drc_rules(self):
+        """تحميل قواعد التصميم من PDK."""
+        with open('../PDK/design_rules.yaml', 'r') as f:
+            self.drc = yaml.safe_load(f)
+        
+        with open('../PDK/layer_stack.json', 'r') as f:
+            self.layer_stack = json.load(f)
+    
+    def validate_parameters(self):
+        """التحقق من توافق المعلمات مع قواعد التصميم."""
+        errors = []
+        
+        # التحقق من نصف القطر
+        min_radius = self.drc['layer_specific'][1]['rules']['ring_resonators']['min_radius']
+        max_radius = self.drc['layer_specific'][1]['rules']['ring_resonators']['max_radius']
+        
+        if not (min_radius <= self.params.radius <= max_radius):
+            errors.append(f"نصف القطر {self.params.radius}μm خارج النطاق [{min_radius}, {max_radius}]μm")
+        
+        # التحقق من فجوة الاقتران
+        min_gap = self.drc['layer_specific'][1]['rules']['ring_resonators']['bus_gap_min']
+        if self.params.gap < min_gap:
+            errors.append(f"فجوة الاقتران {self.params.gap}μm أقل من الحد الأدنى {min_gap}μm")
+        
+        # التحقق من عرض الدليل
+        min_width = self.drc['layer_specific'][1]['rules']['min_width']
+        if self.params.width < min_width:
+            errors.append(f"عرض الدليل {self.params.width}μm أقل من الحد الأدنى {min_width}μm")
+        
+        if errors:
+            raise ValueError("أخطاء في معلمات الحلقة:\n" + "\n".join(errors))
+    
+    def calculate_resonance_properties(self) -> Dict:
+        """
+        حساب خصائص الرنين للحلقة.
+        
+        العائدات:
+            - الطول الموجي للرنين
+            - معامل الجودة (Q)
+            - عرض الخط (FWHM)
+            - طور الرحلة غير الخطي
+        """
+        # محيط الحلقة
+        circumference = 2 * np.pi * self.params.radius
+        
+        # معامل الانكسار الفعال (يعتمد على المادة)
+        if self.params.material == 'Si3N4':
+            n_eff = 1.99
+        else:  # AlGaAs
+            n_eff = 3.25
+        
+        # ترتيب الرنين
+        m = round(n_eff * circumference / self.wavelength)
+        
+        # الطول الموجي للرنين الدقيق
+        lambda_resonant = n_eff * circumference / m
+        
+        # معامل الجودة النظري
+        # Q = λ / Δλ ≈ (π * n_eff * L) / (λ * (αL + |1-κ|²))
+        alpha = 0.1  # dB/cm → 0.023 Np/cm (خسائر)
+        alpha_np_per_m = alpha * 0.23 / 100  # تحويل إلى Nepers/m
+        
+        loss_per_round = np.exp(-alpha_np_per_m * circumference * 1e-6)
+        kappa = self.params.coupling_coefficient
+        # معامل الجودة الشامل
+        q_total = (2 * np.pi * n_eff * circumference * 1e-6) / \
+                  (self.wavelength * 1e-6 * (1 - loss_per_round * (1 - kappa)**2))
+        
+        # عرض الخط (FWHM)
+        fwhm = lambda_resonant / q_total
+        
+        # طور غير خطي متوقع (لـ 1mW)
+        gamma = self.calculate_nonlinear_coefficient()
+        p_input = 1e-3  # 1 mW
+        phi_nl = gamma * p_input * circumference * 1e-6
+        
+        return {
+            'resonant_wavelength_nm': lambda_resonant * 1000,
+            'order': m,
+            'quality_factor': q_total,
+            'fwhm_nm': fwhm * 1000,
+            'free_spectral_range_nm': (self.wavelength**2 * 1000) / (n_eff * circumference),
+            'nonlinear_phase_shift_per_mw': phi_nl / p_input,
+            'circumference_um': circumference
+        }
+    
+    def calculate_nonlinear_coefficient(self) -> float:
+        """حساب معامل كير غير الخطي γ (1/W·m)."""
+        # مساحة المقطع الفعالة
+        if self.params.material == 'Si3N4':
+            a_eff = 0.15e-12  # m²
+            n2 = 2.5e-19      # m²/W
+        else:  # AlGaAs
+            a_eff = 0.12e-12  # m²
+            n2 = 1.5e-17      # m²/W
+        
+        gamma = (2 * np.pi * n2) / (self.wavelength * 1e-6 * a_eff)
+        return gamma
+    
+    def create_ring(self, center: Tuple[float, float]) -> gdspy.Polygon:
+        """إنشاء الحلقة الرنانة الدائرية."""
+        # الحلقة الخارجية
+        outer_radius = self.params.radius + self.params.width/2
+        outer_circle = gdspy.Round(
+            center,
+            outer_radius,
+            tolerance=0.001,
+            layer=self.params.layer[0],
+            datatype=self.params.layer[1]
+        )
+        
+        # الحلقة الداخلية (للتفريغ)
+        inner_radius = max(0.1, self.params.radius - self.params.width/2)
+        inner_circle = gdspy.Round(
+            center,
+            inner_radius,
+            tolerance=0.001,
+            layer=self.params.layer[0],
+            datatype=self.params.layer[1]
+        )
+        
+        # الطرح للحصول على حلقة مجوفة
+        ring = gdspy.boolean(outer_circle, inner_circle, 'not')
+        
+        # إضافة علامة تعريف
+        label = gdspy.Label(
+            f"Ring_R{self.params.radius}",
+            (center[0], center[1] - self.params.radius - 2),
+            layer=1000  # طبقة النص
+        )
+        
+        self.cell.add(ring)
+        self.cell.add(label)
+        
+        return ring
+    
+    def create_bus_waveguide(self, center: Tuple[float, float], 
+                           position: str = 'top') -> gdspy.Polygon:
+        """
+        إنشاء دليل حافلة للاقتران مع الحلقة.
+        
+        Args:
+            position: 'top' أو 'bottom' أو 'both'
+        """
+        bus_y = center[1]
+        bus_length = self.params.radius * 2 + 10  # +5μm من كل جانب
+        
+        if position in ['top', 'both']:
+            # دليل حافلة علوي
+            bus_y_top = center[1] + self.params.radius + self.params.gap
+            bus_top = gdspy.Rectangle(
+                (center[0] - bus_length/2, bus_y_top - self.params.width/2),
+                (center[0] + bus_length/2, bus_y_top + self.params.width/2),
+                layer=self.params.layer[0],
+                datatype=self.params.layer[1]
+            )
+            self.cell.add(bus_top)
+            
+            # منطقة الاقتران العلوية
+            self.create_coupling_region(
+                center, 
+                (center[0], bus_y_top),
+                'top'
+            )
+        
+        if position in ['bottom', 'both']:
+            # دليل حافلة سفلي
+            bus_y_bottom = center[1] - self.params.radius - self.params.gap
+            bus_bottom = gdspy.Rectangle(
+                (center[0] - bus_length/2, bus_y_bottom - self.params.width/2),
+                (center[0] + bus_length/2, bus_y_bottom + self.params.width/2),
+                layer=self.params.layer[0],
+                datatype=self.params.layer[1]
+            )
+            self.cell.add(bus_bottom)
+            
+            # منطقة الاقتران السفلية
+            self.create_coupling_region(
+                center,
+                (center[0], bus_y_bottom),
+                'bottom'
+            )
+        
+        # إضافة نقاط إدخال/إخراج
+        self.create_io_ports(center, bus_length)
+        
+        return bus_top if position == 'top' else bus_bottom if position == 'bottom' else None
+    
+    def create_coupling_region(self, ring_center: Tuple[float, float],
+                             bus_center: Tuple[float, float],
+                             side: str) -> gdspy.Polygon:
+        """إنشاء منطقة الاقتران المحسنة."""
+        # عرض منطقة الاقتران (أوسع قليلاً من الدليل)
+        coupling_width = self.params.width * 1.2
+        
+        # طول منطقة الاقتران
+        coupling_length = self.params.coupling_length
+        
+        # إنشاء مستطيل الاقتران
+        if side == 'top':
+            y_pos = ring_center[1] + self.params.radius + self.params.gap/2
+        else:  # bottom
+            y_pos = ring_center[1] - self.params.radius - self.params.gap/2
+        
+        coupling_rect = gdspy.Rectangle(
+            (ring_center[0] - coupling_length/2, y_pos - coupling_width/2),
+            (ring_center[0] + coupling_length/2, y_pos + coupling_width/2),
+            layer=self.params.layer[0],
+            datatype=1  # datatype مختلف لمنطقة الاقتران
+        )
+        إضافة علامة تشخيصية
+        label = gdspy.Label(
+            f"κ={self.params.coupling_coefficient}",
+            (ring_center[0], y_pos),
+            layer=1000
+        )
+        
+        self.cell.add(coupling_rect)
+        self.cell.add(label)
+        
+        return coupling_rect
+    
+    def create_io_ports(self, center: Tuple[float, float], 
+                       bus_length: float) -> None:
+        """إنشاء منافذ الإدخال/الإخراج مع مقرنات محزوزة."""
+        # مواقع منافذ الإدخال/الإخراج
+        port_positions = [
+            (center[0] - bus_length/2 - 5, center[1] + self.params.radius + self.params.gap),  # Input top
+            (center[0] + bus_length/2 + 5, center[1] + self.params.radius + self.params.gap),  # Output top
+            (center[0] - bus_length/2 - 5, center[1] - self.params.radius - self.params.gap),  # Input bottom
+            (center[0] + bus_length/2 + 5, center[1] - self.params.radius - self.params.gap),  # Output bottom
+        ]
+        
+        port_labels = ['IN_T', 'OUT_T', 'IN_B', 'OUT_B']
+        
+        for (x, y), label in zip(port_positions, port_labels):
+            # إنشاء محزوز إدخال/إخراج مبسط
+            grating = self.create_grating_coupler((x, y))
+            self.cell.add(grating)
+            
+            # إضافة علامة
+            text = gdspy.Label(label, (x, y - 2), layer=1000)
+            self.cell.add(text)
+    
+    def create_grating_coupler(self, position: Tuple[float, float]) -> gdspy.PolygonSet:
+        """إنشاء مقرن محزوز مبسط للإدخال/الإخراج."""
+        x, y = position
+        width = 0.5
+        length = 10
+        
+        # خطوط المحزوز
+        num_teeth = 8
+        period = 0.63  # μm
+        tooth_width = period / 2
+        
+        grating = gdspy.Cell(f"GC_{position}")
+        
+        for i in range(num_teeth):
+            tooth_x = x + i * period
+            tooth = gdspy.Rectangle(
+                (tooth_x, y - width/2),
+                (tooth_x + tooth_width, y + width/2),
+                layer=self.params.layer[0],
+                datatype=self.params.layer[1]
+            )
+            grating.add(tooth)
+        
+        # دليل موجي موصل
+        waveguide = gdspy.Rectangle(
+            (x - 2, y - width/2),
+            (x, y + width/2),
+            layer=self.params.layer[0],
+            datatype=self.params.layer[1]
+        )
+        grating.add(waveguide)
+        
+        return grating
+    
+    def create_thermal_tuner(self, center: Tuple[float, float]) -> Optional[gdspy.Polygon]:
+        """إضافة مسخن حراري لضبط طور الرنين (اختياري)."""
+        if self.params.material != 'AlGaAs':
+            warnings.warn("المسخن الحراري موصى به فقط للعناصر غير الخطية")
+            return None
+        
+        # تصميم مسخن على شكل حلقة حول الحلقة
+        heater_gap = 1.0  # μm بين الحلقة والمسخن
+        heater_width = 0.3
+        
+        heater_outer = self.params.radius + heater_gap + heater_width
+        heater_inner = self.params.radius + heater_gap
+        
+        # الحلقة الخارجية للمسخن
+        outer_heater = gdspy.Round(
+            center,
+            heater_outer,
+            tolerance=0.001,
+            layer=10,  # طبقة TiN
+            datatype=0
+        )
+        
+        # الحلقة الداخلية للمسخن
+        inner_heater = gdspy.Round(
+            center,
+            heater_inner,
+            tolerance=0.001,
+            layer=10,
+            datatype=0
+        )
+        
+        # مسخن على شكل حلقة
+        heater = gdspy.boolean(outer_heater, inner_heater, 'not')
+        
+        # نقاط التوصيل الكهربائي
+        contact_size = 2
+        left_contact = gdspy.Rectangle(
+            (center[0] - heater_outer - contact_size, center[1] - contact_size/2),
+            (center[0] - heater_outer, center[1] + contact_size/2),
+            layer=10,
+            datatype=0
+        )
+        
+        right_contact = gdspy.Rectangle(
+            (center[0] + heater_outer, center[1] - contact_size/2),
+            (center[0] + heater_outer + contact_size, center[1] + contact_size/2),
+            layer=10,
+            datatype=0
+        )
+        self.cell.add(heater)
+        self.cell.add(left_contact)
+        self.cell.add(right_contact)
+        
+        # إضافة علامة
+        label = gdspy.Label(
+            "Thermal_Tuner",
+            (center[0], center[1] - heater_outer - 2),
+            layer=1000
+        )
+        self.cell.add(label)
+        
+        return heater
+    
+    def create_test_structures(self, center: Tuple[float, float]) -> None:
+        """إضافة هياكل اختبار حول الحلقة."""
+        test_x = center[0] + self.params.radius * 2 + 20
+        
+        # 1. هياكل لقياس فجوة الاقتران
+        for i, gap in enumerate([0.15, 0.2, 0.25, 0.3]):
+            test_ring = NonlinearRingResonator(RingParameters(
+                radius=3.0,
+                width=0.5,
+                gap=gap,
+                material=self.params.material,
+                layer=self.params.layer
+            ))
+            
+            test_cell = test_ring.build((test_x, center[1] + i * 15))
+            
+            # نسخ إلى الخلية الرئيسية
+            for element in test_cell.get_polygons():
+                self.cell.add(element)
+        
+        # 2. هياكل لقياس نصف القطر
+        for i, radius in enumerate([3.0, 5.0, 7.0, 10.0]):
+            test_ring = NonlinearRingResonator(RingParameters(
+                radius=radius,
+                width=0.5,
+                gap=0.2,
+                material=self.params.material,
+                layer=self.params.layer
+            ))
+            
+            test_cell = test_ring.build((test_x + 30, center[1] + i * 15))
+            
+            for element in test_cell.get_polygons():
+                self.cell.add(element)
+    
+    def build(self, center: Tuple[float, float] = (0, 0), 
+             add_test_structures: bool = True) -> gdspy.Cell:
+        """
+        بناء الحلقة الرنانة الكاملة مع جميع المكونات.
+        
+        Args:
+            center: مركز التصميم
+            add_test_structures: إضافة هياكل اختبار
+            
+        Returns:
+            خلية gdspy تحتوي على التصميم الكامل
+        """
+        print(f"بناء الحلقة الرنانة غير الخطية...")
+        print(f"  المادة: {self.params.material}")
+        print(f"  نصف القطر: {self.params.radius}μm")
+        print(f"  فجوة الاقتران: {self.params.gap}μm")
+        
+        # حساب خصائص الرنين
+        resonance = self.calculate_resonance_properties()
+        print(f"\nخصائص الرنين:")
+        print(f"  الطول الموجي للرنين: {resonance['resonant_wavelength_nm']:.2f} nm")
+        print(f"  معامل الجودة: {resonance['quality_factor']:.0f}")
+        print(f"  عرض الخط: {resonance['fwhm_nm']:.3f} nm")
+        print(f"  طور غير خطي (لـ 1mW): {resonance['nonlinear_phase_shift_per_mw']:.3f} rad/mW")
+        
+        # 1. إنشاء الحلقة الرئيسية
+        self.create_ring(center)
+        
+        # 2. إنشاء أدلة الحافلة (علوي وسفلي)
+        self.create_bus_waveguide(center, 'both')
+        
+        # 3. إضافة مسخن حراري (إذا كانت المادة غير خطية)
+        if self.params.material == 'AlGaAs':
+            self.create_thermal_tuner(center)
+        
+        # 4. إضافة هياكل اختبار
+        if add_test_structures:
+            self.create_test_structures(center)
+        
+        # 5. إضافة معلومات تصميمية
+        self.add_design_info(center, resonance)
+        
+        print(f"\nتم بناء الحلقة بنجاح في الخلية: {self.cell.name}")
+        
+        return self.cell
+    
+    def add_design_info(self, center: Tuple[float, float], resonance: Dict) -> None:
+        """إضافة معلومات التصميم كنص في الخلية."""
+        info_x = center[0] - self.params.radius * 2 - 10
+        info_y = center[1] + self.params.radius + 10
+        
+        info_lines = [
+            f"Nonlinear Ring Resonator",
+            f"Material: {self.params.material}",
+            f"Radius: {self.params.radius}μm",
+            f"Waveguide: {self.params.width}μm",
+            f"Gap: {self.params.gap}μm",
+            f"λ_res: {resonance['resonant_wavelength_nm']:.2f}nm",
+            f"Q: {resonance['quality_factor']:.0f}",
+            f"FSR: {resonance['free_spectral_range_nm']:.2f}nm",
+            f"κ: {self.params.coupling_coefficient}",
+        ]
+        
+        for i, line in enumerate(info_lines):
+            label = gdspy.Label(
+                line,
+                (info_x, info_y - i * 1.5),
+                layer=1000
+            )
+            self.cell.add(label)
+    
+    def export_gds(self, filename: str = None) -> str:
+        """تصدير التصميم إلى ملف GDSII."""
+        if filename is None:
+            filename = f"ring_resonator_R{self.params.radius}.gds"
+        
+        # إنشاء المكتبة وإضافة الخلية
+        lib = gdspy.GdsLibrary()
+        lib.add(self.cell)
+        
+        # الحفظ في ملف
+        lib.write_gds(f"../layouts/gds/{filename}")
+        
+        print(f"تم تصدير التصميم إلى: layouts/gds/{filename}")
+        
+        return filename
+
+# ============================================================================
+# دالة مساعدة لإنشاء مصفوفة حلقات للاختبار
+# ============================================================================
+
+def create_ring_array(center: Tuple[float, float] = (0, 0),
+                     rows: int = 3,
+                     cols: int = 4,
+                     radius_start: float = 3.0,
+                     radius_step: float = 0.5,
+                     gap_start: float = 0.15,
+                     gap_step: float = 0.05) -> gdspy.Cell:
+    """
+    إنشاء مصفوفة من الحلقات الرنانة بمعلمات مختلفة للاختبار.
+    
+    Args:
+        rows: عدد الصفوف
+        cols: عدد الأعمدة
+        radius_start: نصف قطر أول حلقة
+        radius_step: زيادة نصف القطر بين الحلقات
+        gap_start: فجوة الاقتران الأولية
+        gap_step: زيادة فجوة الاقتران
+    
+    Returns:
+        خلية تحتوي على مصفوفة الحلقات
+    """
+    array_cell = gdspy.Cell("Ring_Resonator_Array")
+    
+    spacing_x = 50
+    spacing_y = 40
+    
+    for row in range(rows):
+        for col in range(cols):
+            # حساب المعلمات لهذه الحلقة
+            radius = radius_start + row * radius_step
+            gap = gap_start + col * gap_step
+            
+            # تحديد المادة بناءً على نصف القطر
+            material = 'AlGaAs' if radius >= 5.0 else 'Si3N4'
+            layer = (2, 0) if material == 'AlGaAs' else (1, 0)
+            
+            # إنشاء الحلقة
+   params = RingParameters(
+                radius=radius,
+                width=0.5,
+                gap=gap,
+                material=material,
+                layer=layer
+            )
+            
+            ring_designer = NonlinearRingResonator(params)
+            
+            # حساب المركز لهذه الحلقة
+            ring_center = (
+                center[0] + col * spacing_x,
+                center[1] + row * spacing_y
+            )
+            
+            # بناء الحلقة (بدون هياكل اختبار إضافية)
+            ring_cell = ring_designer.build(ring_center, add_test_structures=False)
+            
+            # نسخ المضلعات إلى الخلية الرئيسية
+            for polygon in ring_cell.get_polygons():
+                array_cell.add(polygon)
+            
+            # إضافة معلومات مختصرة
+            label = gdspy.Label(
+                f"R{radius:.1f} G{gap:.2f}",
+                (ring_center[0], ring_center[1] - radius - 5),
+                layer=1000
+            )
+            array_cell.add(label)
+    
+    return array_cell
+
+# ============================================================================
+# مثال تشغيلي سريع
+# ============================================================================
+
+def example_ring_design():
+    """مثال سريع لتصميم حلقة رنانة."""
+    print("مثال تصميم الحلقة الرنانة غير الخطية")
+    print("=" * 50)
+    
+    # 1. تعريف معلمات الحلقة
+    params = RingParameters(
+        radius=5.0,      # نصف القطر 5μm
+        width=0.5,       # عرض الدليل 500nm
+        gap=0.2,         # فجوة الاقتران 200nm
+        material='AlGaAs', # مادة غير خطية
+        layer=(2, 0),    # طبقة AlGaAs
+        nonlinear_index=1.5e-17,  # n₂ لـ AlGaAs
+        coupling_coefficient=0.1  # اقتران 10%
+    )
+    
+    # 2. إنشاء المصمم
+    ring_designer = NonlinearRingResonator(params)
+    
+    # 3. بناء التصميم
+    ring_cell = ring_designer.build(center=(100, 100))
+    
+    # 4. التصدير إلى GDS
+    ring_designer.export_gds("nonlinear_ring_resonator.gds")
+    
+    # 5. إنشاء مصفوفة اختبار
+    array_cell = create_ring_array(center=(0, 0), rows=2, cols=3)
+    
+    # حفظ المصفوفة
+    lib = gdspy.GdsLibrary()
+    lib.add(array_cell)
+    lib.write_gds("../layouts/gds/ring_test_array.gds")
+    
+    print("\nتم إنشاء ملفين GDS:")
+    print("  1. layouts/gds/nonlinear_ring_resonator.gds - حلقة فردية")
+    print("  2. layouts/gds/ring_test_array.gds - مصفوفة اختبار")
+    
+    return ring_cell, array_cell
+
+if __name__ == "__main__":
+    # تشغيل المثال عند تنفيذ الملف مباشرة
+    ring_cell, array_cell = example_ring_design()
+```
